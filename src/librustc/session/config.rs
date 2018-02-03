@@ -27,7 +27,7 @@ use lint;
 use middle::cstore;
 
 use syntax::ast::{self, IntTy, UintTy};
-use syntax::codemap::FilePathMapping;
+use syntax::codemap::{FilePathMapping, FileName};
 use syntax::parse::token;
 use syntax::parse;
 use syntax::symbol::Symbol;
@@ -70,6 +70,26 @@ pub enum OptLevel {
     Aggressive, // -O3
     Size, // -Os
     SizeMin, // -Oz
+}
+
+#[derive(Clone, Copy, PartialEq, Hash)]
+pub enum Lto {
+    /// Don't do any LTO whatsoever
+    No,
+
+    /// Do a full crate graph LTO. The flavor is determined by the compiler
+    /// (currently the default is "fat").
+    Yes,
+
+    /// Do a full crate graph LTO with ThinLTO
+    Thin,
+
+    /// Do a local graph LTO with ThinLTO (only relevant for multiple codegen
+    /// units).
+    ThinLocal,
+
+    /// Do a full crate graph LTO with "fat" LTO
+    Fat,
 }
 
 #[derive(Clone, Copy, PartialEq, Hash)]
@@ -362,6 +382,9 @@ top_level_options!(
 
         debugging_opts: DebuggingOptions [TRACKED],
         prints: Vec<PrintRequest> [UNTRACKED],
+        // Determines which borrow checker(s) to run. This is the parsed, sanitized
+        // version of `debugging_opts.borrowck`, which is just a plain string.
+        borrowck_mode: BorrowckMode [UNTRACKED],
         cg: CodegenOptions [TRACKED],
         // FIXME(mw): We track this for now but it actually doesn't make too
         //            much sense: The value of this option can stay the same
@@ -380,8 +403,13 @@ top_level_options!(
         // try to not rely on this too much.
         actually_rustdoc: bool [TRACKED],
 
-        // Number of object files/codegen units to produce on the backend
+        // Specifications of codegen units / ThinLTO which are forced as a
+        // result of parsing command line options. These are not necessarily
+        // what rustc was invoked with, but massaged a bit to agree with
+        // commands like `--emit llvm-ir` which they're often incompatible with
+        // if we otherwise use the defaults of rustc.
         cli_forced_codegen_units: Option<usize> [UNTRACKED],
+        cli_forced_thinlto_off: bool [UNTRACKED],
     }
 );
 
@@ -401,12 +429,38 @@ pub enum PrintRequest {
     NativeStaticLibs,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BorrowckMode {
+    Ast,
+    Mir,
+    Compare,
+}
+
+impl BorrowckMode {
+    /// Should we emit the AST-based borrow checker errors?
+    pub fn use_ast(self) -> bool {
+        match self {
+            BorrowckMode::Ast => true,
+            BorrowckMode::Compare => true,
+            BorrowckMode::Mir => false,
+        }
+    }
+    /// Should we emit the MIR-based borrow checker errors?
+    pub fn use_mir(self) -> bool {
+        match self {
+            BorrowckMode::Ast => false,
+            BorrowckMode::Compare => true,
+            BorrowckMode::Mir => true,
+        }
+    }
+}
+
 pub enum Input {
     /// Load source from file
     File(PathBuf),
     Str {
         /// String that is shown in place of a filename
-        name: String,
+        name: FileName,
         /// Anonymous source string
         input: String,
     },
@@ -494,6 +548,25 @@ impl OutputFilenames {
     pub fn filestem(&self) -> String {
         format!("{}{}", self.out_filestem, self.extra)
     }
+
+    pub fn contains_path(&self, input_path: &PathBuf) -> bool {
+        let input_path = input_path.canonicalize().ok();
+        if input_path.is_none() {
+            return false
+        }
+        match self.single_output_file {
+            Some(ref output_path) => output_path.canonicalize().ok() == input_path,
+            None => {
+                for k in self.outputs.keys() {
+                    let output_path = self.path(k.to_owned());
+                    if output_path.canonicalize().ok() == input_path {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
 }
 
 pub fn host_triple() -> &'static str {
@@ -526,6 +599,7 @@ pub fn basic_options() -> Options {
         incremental: None,
         debugging_opts: basic_debugging_options(),
         prints: Vec::new(),
+        borrowck_mode: BorrowckMode::Ast,
         cg: basic_codegen_options(),
         error_format: ErrorOutputType::default(),
         externs: Externs(BTreeMap::new()),
@@ -536,6 +610,7 @@ pub fn basic_options() -> Options {
         debug_assertions: true,
         actually_rustdoc: false,
         cli_forced_codegen_units: None,
+        cli_forced_thinlto_off: false,
     }
 }
 
@@ -559,6 +634,12 @@ impl Options {
                 self.debugging_opts.remap_path_prefix_to.iter()
             ).map(|(src, dst)| (src.clone(), dst.clone())).collect()
         )
+    }
+
+    /// True if there will be an output file generated
+    pub fn will_create_output_file(&self) -> bool {
+        !self.debugging_opts.parse_only && // The file is just being parsed
+            !self.debugging_opts.ls // The file is just being queried
     }
 }
 
@@ -697,7 +778,9 @@ macro_rules! options {
             Some("one of: `y`, `yes`, `on`, `n`, `no`, or `off`");
         pub const parse_string: Option<&'static str> = Some("a string");
         pub const parse_string_push: Option<&'static str> = Some("a string");
+        pub const parse_pathbuf_push: Option<&'static str> = Some("a path");
         pub const parse_opt_string: Option<&'static str> = Some("a string");
+        pub const parse_opt_pathbuf: Option<&'static str> = Some("a path");
         pub const parse_list: Option<&'static str> = Some("a space-separated list of strings");
         pub const parse_opt_list: Option<&'static str> = Some("a space-separated list of strings");
         pub const parse_uint: Option<&'static str> = Some("a number");
@@ -715,12 +798,17 @@ macro_rules! options {
             Some(::rustc_back::LinkerFlavor::one_of());
         pub const parse_optimization_fuel: Option<&'static str> =
             Some("crate=integer");
+        pub const parse_unpretty: Option<&'static str> =
+            Some("`string` or `string=string`");
+        pub const parse_lto: Option<&'static str> =
+            Some("one of `thin`, `fat`, or omitted");
     }
 
     #[allow(dead_code)]
     mod $mod_set {
-        use super::{$struct_name, Passes, SomePasses, AllPasses, Sanitizer};
+        use super::{$struct_name, Passes, SomePasses, AllPasses, Sanitizer, Lto};
         use rustc_back::{LinkerFlavor, PanicStrategy, RelroLevel};
+        use std::path::PathBuf;
 
         $(
             pub fn $opt(cg: &mut $struct_name, v: Option<&str>) -> bool {
@@ -761,6 +849,13 @@ macro_rules! options {
             }
         }
 
+        fn parse_opt_pathbuf(slot: &mut Option<PathBuf>, v: Option<&str>) -> bool {
+            match v {
+                Some(s) => { *slot = Some(PathBuf::from(s)); true },
+                None => false,
+            }
+        }
+
         fn parse_string(slot: &mut String, v: Option<&str>) -> bool {
             match v {
                 Some(s) => { *slot = s.to_string(); true },
@@ -771,6 +866,13 @@ macro_rules! options {
         fn parse_string_push(slot: &mut Vec<String>, v: Option<&str>) -> bool {
             match v {
                 Some(s) => { slot.push(s.to_string()); true },
+                None => false,
+            }
+        }
+
+        fn parse_pathbuf_push(slot: &mut Vec<PathBuf>, v: Option<&str>) -> bool {
+            match v {
+                Some(s) => { slot.push(PathBuf::from(s)); true },
                 None => false,
             }
         }
@@ -887,6 +989,27 @@ macro_rules! options {
                 }
             }
         }
+
+        fn parse_unpretty(slot: &mut Option<String>, v: Option<&str>) -> bool {
+            match v {
+                None => false,
+                Some(s) if s.split('=').count() <= 2 => {
+                    *slot = Some(s.to_string());
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        fn parse_lto(slot: &mut Lto, v: Option<&str>) -> bool {
+            *slot = match v {
+                None => Lto::Yes,
+                Some("thin") => Lto::Thin,
+                Some("fat") => Lto::Fat,
+                Some(_) => return false,
+            };
+            true
+        }
     }
 ) }
 
@@ -895,7 +1018,7 @@ options! {CodegenOptions, CodegenSetter, basic_codegen_options,
          CG_OPTIONS, cg_type_desc, cgsetters,
     ar: Option<String> = (None, parse_opt_string, [UNTRACKED],
         "this option is deprecated and does nothing"),
-    linker: Option<String> = (None, parse_opt_string, [UNTRACKED],
+    linker: Option<PathBuf> = (None, parse_opt_pathbuf, [UNTRACKED],
         "system linker to link outputs with"),
     link_arg: Vec<String> = (vec![], parse_string_push, [UNTRACKED],
         "a single extra argument to append to the linker invocation (can be used several times)"),
@@ -903,7 +1026,7 @@ options! {CodegenOptions, CodegenSetter, basic_codegen_options,
         "extra arguments to append to the linker invocation (space separated)"),
     link_dead_code: bool = (false, parse_bool, [UNTRACKED],
         "don't let linker strip dead code (turning it on can be used for code coverage)"),
-    lto: bool = (false, parse_bool, [TRACKED],
+    lto: Lto = (Lto::No, parse_lto, [TRACKED],
         "perform LLVM link-time optimizations"),
     target_cpu: Option<String> = (None, parse_opt_string, [TRACKED],
         "select target processor (rustc --print target-cpus for details)"),
@@ -960,11 +1083,15 @@ options! {CodegenOptions, CodegenSetter, basic_codegen_options,
         "set the threshold for inlining a function (default: 225)"),
     panic: Option<PanicStrategy> = (None, parse_panic_strategy,
         [TRACKED], "panic strategy to compile crate with"),
+    incremental: Option<String> = (None, parse_opt_string, [UNTRACKED],
+          "enable incremental compilation"),
 }
 
 options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
          build_debugging_options, "Z", "debugging",
          DB_OPTIONS, db_type_desc, dbsetters,
+    codegen_backend: Option<String> = (None, parse_opt_string, [TRACKED],
+        "the backend to use"),
     verbose: bool = (false, parse_bool, [UNTRACKED],
         "in general, enable more debug printouts"),
     span_free_formats: bool = (false, parse_bool, [UNTRACKED],
@@ -973,8 +1100,10 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "make unnamed regions display as '# (where # is some non-ident unique id)"),
     emit_end_regions: bool = (false, parse_bool, [UNTRACKED],
         "emit EndRegion as part of MIR; enable transforms that solely process EndRegion"),
-    borrowck_mir: bool = (false, parse_bool, [UNTRACKED],
-        "implicitly treat functions as if they have `#[rustc_mir_borrowck]` attribute"),
+    borrowck: Option<String> = (None, parse_opt_string, [UNTRACKED],
+        "select which borrowck is used (`ast`, `mir`, or `compare`)"),
+    two_phase_borrows: bool = (false, parse_bool, [UNTRACKED],
+        "use two-phase reserved/active distinction for `&mut` borrows in MIR borrowck"),
     time_passes: bool = (false, parse_bool, [UNTRACKED],
         "measure time of each rustc pass"),
     count_llvm_insns: bool = (false, parse_bool,
@@ -1000,8 +1129,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "gather borrowck statistics"),
     no_landing_pads: bool = (false, parse_bool, [TRACKED],
         "omit landing pads for unwinding"),
-    debug_llvm: bool = (false, parse_bool, [UNTRACKED],
-        "enable debug output from LLVM"),
+    fewer_names: bool = (false, parse_bool, [TRACKED],
+        "reduce memory use by retaining fewer names within compilation artifacts (LLVM-IR)"),
     meta_stats: bool = (false, parse_bool, [UNTRACKED],
         "gather metadata statistics"),
     print_link_args: bool = (false, parse_bool, [UNTRACKED],
@@ -1010,6 +1139,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "prints the llvm optimization passes being run"),
     ast_json: bool = (false, parse_bool, [UNTRACKED],
         "print the AST as JSON and halt"),
+    query_threads: Option<usize> = (None, parse_opt_uint, [UNTRACKED],
+        "execute queries on a thread pool with N threads"),
     ast_json_noexpand: bool = (false, parse_bool, [UNTRACKED],
         "print the pre-expansion AST as JSON and halt"),
     ls: bool = (false, parse_bool, [UNTRACKED],
@@ -1017,16 +1148,14 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     save_analysis: bool = (false, parse_bool, [UNTRACKED],
         "write syntax and type analysis (in JSON format) information, in \
          addition to normal output"),
-    print_move_fragments: bool = (false, parse_bool, [UNTRACKED],
-        "print out move-fragment data for every fn"),
     flowgraph_print_loans: bool = (false, parse_bool, [UNTRACKED],
-        "include loan analysis data in --unpretty flowgraph output"),
+        "include loan analysis data in -Z unpretty flowgraph output"),
     flowgraph_print_moves: bool = (false, parse_bool, [UNTRACKED],
-        "include move analysis data in --unpretty flowgraph output"),
+        "include move analysis data in -Z unpretty flowgraph output"),
     flowgraph_print_assigns: bool = (false, parse_bool, [UNTRACKED],
-        "include assignment analysis data in --unpretty flowgraph output"),
+        "include assignment analysis data in -Z unpretty flowgraph output"),
     flowgraph_print_all: bool = (false, parse_bool, [UNTRACKED],
-        "include all dataflow analysis data in --unpretty flowgraph output"),
+        "include all dataflow analysis data in -Z unpretty flowgraph output"),
     print_region_graph: bool = (false, parse_bool, [UNTRACKED],
          "prints region inference graph. \
           Use with RUST_REGION_GRAPH=help for more info"),
@@ -1038,12 +1167,12 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "treat all errors that occur as bugs"),
     external_macro_backtrace: bool = (false, parse_bool, [UNTRACKED],
           "show macro backtraces even for non-local macros"),
+    teach: bool = (false, parse_bool, [TRACKED],
+          "show extended diagnostic help"),
     continue_parse_after_error: bool = (false, parse_bool, [TRACKED],
           "attempt to recover from parse errors (experimental)"),
     incremental: Option<String> = (None, parse_opt_string, [UNTRACKED],
           "enable incremental compilation (experimental)"),
-    incremental_cc: bool = (false, parse_bool, [UNTRACKED],
-          "enable cross-crate incremental compilation (even more experimental)"),
     incremental_queries: bool = (true, parse_bool, [UNTRACKED],
           "enable incremental compilation support for queries (experimental)"),
     incremental_info: bool = (false, parse_bool, [UNTRACKED],
@@ -1052,6 +1181,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "dump hash information in textual format to stdout"),
     incremental_verify_ich: bool = (false, parse_bool, [UNTRACKED],
         "verify incr. comp. hashes of green query instances"),
+    incremental_ignore_spans: bool = (false, parse_bool, [UNTRACKED],
+        "ignore spans during ICH computation -- used for testing"),
     dump_dep_graph: bool = (false, parse_bool, [UNTRACKED],
           "dump the dependency graph to $RUST_DEP_GRAPH (default: /tmp/dep_graph.gv)"),
     query_dep_graph: bool = (false, parse_bool, [UNTRACKED],
@@ -1090,7 +1221,7 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "emit noalias metadata for mutable references"),
     dump_mir: Option<String> = (None, parse_opt_string, [UNTRACKED],
           "dump MIR state at various points in translation"),
-    dump_mir_dir: Option<String> = (None, parse_opt_string, [UNTRACKED],
+    dump_mir_dir: String = (String::from("mir_dump"), parse_string, [UNTRACKED],
           "the directory the MIR is dumped into"),
     dump_mir_graphviz: bool = (false, parse_bool, [UNTRACKED],
           "in addition to `.mir` files, create graphviz `.dot` files"),
@@ -1107,6 +1238,8 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
           "print some statistics about MIR"),
     always_encode_mir: bool = (false, parse_bool, [TRACKED],
           "encode MIR of all functions into the crate metadata"),
+    miri: bool = (false, parse_bool, [TRACKED],
+          "check the miri const evaluator against the old ctfe"),
     osx_rpath_install_name: bool = (false, parse_bool, [TRACKED],
           "pass `-install_name @rpath/...` to the macOS linker"),
     sanitizer: Option<Sanitizer> = (None, parse_sanitizer, [TRACKED],
@@ -1117,9 +1250,9 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "set the optimization fuel quota for a crate"),
     print_fuel: Option<String> = (None, parse_opt_string, [TRACKED],
         "make Rustc print the total optimization fuel used by a crate"),
-    remap_path_prefix_from: Vec<String> = (vec![], parse_string_push, [TRACKED],
+    remap_path_prefix_from: Vec<PathBuf> = (vec![], parse_pathbuf_push, [TRACKED],
         "add a source pattern to the file path remapping config"),
-    remap_path_prefix_to: Vec<String> = (vec![], parse_string_push, [TRACKED],
+    remap_path_prefix_to: Vec<PathBuf> = (vec![], parse_pathbuf_push, [TRACKED],
         "add a mapping target to the file path remapping config"),
     force_unstable_if_unmarked: bool = (false, parse_bool, [TRACKED],
         "force all crates to be `rustc_private` unstable"),
@@ -1133,9 +1266,11 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
         "choose which RELRO level to use"),
     nll: bool = (false, parse_bool, [UNTRACKED],
                  "run the non-lexical lifetimes MIR pass"),
+    nll_dump_cause: bool = (false, parse_bool, [UNTRACKED],
+                 "dump cause information when reporting errors from NLL"),
     trans_time_graph: bool = (false, parse_bool, [UNTRACKED],
         "generate a graphical HTML report of time spent in trans and LLVM"),
-    thinlto: bool = (false, parse_bool, [TRACKED],
+    thinlto: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "enable ThinLTO when possible"),
     inline_in_all_cgus: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "control whether #[inline] functions are in all cgus"),
@@ -1144,9 +1279,24 @@ options! {DebuggingOptions, DebuggingSetter, basic_debugging_options,
     saturating_float_casts: bool = (false, parse_bool, [TRACKED],
         "make float->int casts UB-free: numbers outside the integer type's range are clipped to \
          the max/min integer respectively, and NaN is mapped to 0"),
-    lower_128bit_ops: bool = (false, parse_bool, [TRACKED],
+    lower_128bit_ops: Option<bool> = (None, parse_opt_bool, [TRACKED],
         "rewrite operators on i128 and u128 into lang item calls (typically provided \
-         by compiler-builtins) so translation doesn't need to support them"),
+         by compiler-builtins) so translation doesn't need to support them,
+         overriding the default for the current target"),
+    human_readable_cgu_names: bool = (false, parse_bool, [TRACKED],
+        "generate human-readable, predictable names for codegen units"),
+    dep_info_omit_d_target: bool = (false, parse_bool, [TRACKED],
+        "in dep-info output, omit targets for tracking dependencies of the dep-info files \
+         themselves"),
+    approximate_suggestions: bool = (false, parse_bool, [UNTRACKED],
+        "include machine-applicability of suggestions in JSON output"),
+    unpretty: Option<String> = (None, parse_unpretty, [UNTRACKED],
+        "Present the input source, unstable (and less-pretty) variants;
+        valid types are any of the types for `--pretty`, as well as:
+        `flowgraph=<nodeid>` (graphviz formatted flowgraph for node),
+        `everybody_loops` (all function bodies replaced with `loop {}`),
+        `hir` (the HIR), `hir,identified`, or
+        `hir,typed` (HIR with types for each node)."),
 }
 
 pub fn default_lib_output() -> CrateType {
@@ -1219,7 +1369,7 @@ pub fn build_target_config(opts: &Options, sp: &Handler) -> Config {
             sp.struct_fatal(&format!("Error loading target specification: {}", e))
                 .help("Use `--print target-list` for a list of built-in targets")
                 .emit();
-            panic!(FatalError);
+            FatalError.raise();
         }
     };
 
@@ -1227,8 +1377,8 @@ pub fn build_target_config(opts: &Options, sp: &Handler) -> Config {
         "16" => (ast::IntTy::I16, ast::UintTy::U16),
         "32" => (ast::IntTy::I32, ast::UintTy::U32),
         "64" => (ast::IntTy::I64, ast::UintTy::U64),
-        w    => panic!(sp.fatal(&format!("target specification was invalid: \
-                                          unrecognized target-pointer-width {}", w))),
+        w    => sp.fatal(&format!("target specification was invalid: \
+                                          unrecognized target-pointer-width {}", w)).raise(),
     };
 
     Config {
@@ -1420,14 +1570,6 @@ pub fn rustc_optgroups() -> Vec<RustcOptGroup> {
                   `expanded` (crates expanded), or
                   `expanded,identified` (fully parenthesized, AST nodes with IDs).",
                  "TYPE"),
-        opt::opt("", "unpretty",
-                 "Present the input source, unstable (and less-pretty) variants;
-                  valid types are any of the types for `--pretty`, as well as:
-                  `flowgraph=<nodeid>` (graphviz formatted flowgraph for node),
-                  `everybody_loops` (all function bodies replaced with `loop {}`),
-                  `hir` (the HIR), `hir,identified`, or
-                  `hir,typed` (HIR with types for each node).",
-                 "TYPE"),
     ]);
     opts
 }
@@ -1437,7 +1579,7 @@ pub fn parse_cfgspecs(cfgspecs: Vec<String> ) -> ast::CrateConfig {
     cfgspecs.into_iter().map(|s| {
         let sess = parse::ParseSess::new(FilePathMapping::empty());
         let mut parser =
-            parse::new_parser_from_source_str(&sess, "cfgspec".to_string(), s.to_string());
+            parse::new_parser_from_source_str(&sess, FileName::CfgSpec, s.to_string());
 
         let meta_item = panictry!(parser.parse_meta_item());
 
@@ -1526,8 +1668,7 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
     let mut debugging_opts = build_debugging_options(matches, error_format);
 
     if !debugging_opts.unstable_options && error_format == ErrorOutputType::Json(true) {
-        early_error(ErrorOutputType::Json(false),
-                    "--error-format=pretty-json is unstable");
+        early_error(ErrorOutputType::Json(false), "--error-format=pretty-json is unstable");
     }
 
     let mut output_types = BTreeMap::new();
@@ -1559,18 +1700,19 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
         for source in &debugging_opts.remap_path_prefix_from[remap_path_prefix_targets..] {
             early_error(error_format,
                 &format!("option `-Zremap-path-prefix-from='{}'` does not have \
-                         a corresponding `-Zremap-path-prefix-to`", source))
+                         a corresponding `-Zremap-path-prefix-to`", source.display()))
         }
     } else if remap_path_prefix_targets > remap_path_prefix_sources {
         for target in &debugging_opts.remap_path_prefix_to[remap_path_prefix_sources..] {
             early_error(error_format,
                 &format!("option `-Zremap-path-prefix-to='{}'` does not have \
-                          a corresponding `-Zremap-path-prefix-from`", target))
+                          a corresponding `-Zremap-path-prefix-from`", target.display()))
         }
     }
 
     let mut cg = build_codegen_options(matches, error_format);
     let mut codegen_units = cg.codegen_units;
+    let mut disable_thinlto = false;
 
     // Issue #30063: if user requests llvm-related output to one
     // particular path, disable codegen-units.
@@ -1592,17 +1734,42 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
                     }
                     early_warn(error_format, "resetting to default -C codegen-units=1");
                     codegen_units = Some(1);
+                    disable_thinlto = true;
                 }
             }
-            _ => codegen_units = Some(1),
+            _ => {
+                codegen_units = Some(1);
+                disable_thinlto = true;
+            }
         }
+    }
+
+    if debugging_opts.query_threads == Some(0) {
+        early_error(error_format, "Value for query threads must be a positive nonzero integer");
     }
 
     if codegen_units == Some(0) {
         early_error(error_format, "Value for codegen units must be a positive nonzero integer");
     }
 
-    if cg.lto && debugging_opts.incremental.is_some() {
+    let incremental = match (&debugging_opts.incremental, &cg.incremental) {
+        (&Some(ref path1), &Some(ref path2)) => {
+            if path1 != path2 {
+                early_error(error_format,
+                    &format!("conflicting paths for `-Z incremental` and \
+                              `-C incremental` specified: {} versus {}",
+                              path1,
+                              path2));
+            } else {
+                Some(path1)
+            }
+        }
+        (&Some(ref path), &None) => Some(path),
+        (&None, &Some(ref path)) => Some(path),
+        (&None, &None) => None,
+    }.map(|m| PathBuf::from(m));
+
+    if cg.lto != Lto::No && incremental.is_some() {
         early_error(error_format, "can't perform LTO when compiling incrementally");
     }
 
@@ -1743,6 +1910,15 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
         }
     }));
 
+    let borrowck_mode = match debugging_opts.borrowck.as_ref().map(|s| &s[..]) {
+        None | Some("ast") => BorrowckMode::Ast,
+        Some("mir") => BorrowckMode::Mir,
+        Some("compare") => BorrowckMode::Compare,
+        Some(m) => {
+            early_error(error_format, &format!("unknown borrowck mode `{}`", m))
+        },
+    };
+
     if !cg.remark.is_empty() && debuginfo == NoDebugInfo {
         early_warn(error_format, "-C remark will not show source locations without \
                                 --debuginfo");
@@ -1767,8 +1943,6 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
 
     let crate_name = matches.opt_str("crate-name");
 
-    let incremental = debugging_opts.incremental.as_ref().map(|m| PathBuf::from(m));
-
     (Options {
         crate_types,
         optimize: opt_level,
@@ -1784,6 +1958,7 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
         incremental,
         debugging_opts,
         prints,
+        borrowck_mode,
         cg,
         error_format,
         externs: Externs(externs),
@@ -1794,6 +1969,7 @@ pub fn build_session_options_and_crate_config(matches: &getopts::Matches)
         debug_assertions,
         actually_rustdoc: false,
         cli_forced_codegen_units: codegen_units,
+        cli_forced_thinlto_off: disable_thinlto,
     },
     cfg)
 }
@@ -1911,7 +2087,7 @@ mod dep_tracking {
     use std::hash::Hash;
     use std::path::PathBuf;
     use std::collections::hash_map::DefaultHasher;
-    use super::{Passes, CrateType, OptLevel, DebugInfoLevel,
+    use super::{Passes, CrateType, OptLevel, DebugInfoLevel, Lto,
                 OutputTypes, Externs, ErrorOutputType, Sanitizer};
     use syntax::feature_gate::UnstableFeatures;
     use rustc_back::{PanicStrategy, RelroLevel};
@@ -1950,6 +2126,7 @@ mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(usize);
     impl_dep_tracking_hash_via_hash!(u64);
     impl_dep_tracking_hash_via_hash!(String);
+    impl_dep_tracking_hash_via_hash!(PathBuf);
     impl_dep_tracking_hash_via_hash!(lint::Level);
     impl_dep_tracking_hash_via_hash!(Option<bool>);
     impl_dep_tracking_hash_via_hash!(Option<usize>);
@@ -1965,6 +2142,7 @@ mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(RelroLevel);
     impl_dep_tracking_hash_via_hash!(Passes);
     impl_dep_tracking_hash_via_hash!(OptLevel);
+    impl_dep_tracking_hash_via_hash!(Lto);
     impl_dep_tracking_hash_via_hash!(DebugInfoLevel);
     impl_dep_tracking_hash_via_hash!(UnstableFeatures);
     impl_dep_tracking_hash_via_hash!(Externs);
@@ -1974,6 +2152,7 @@ mod dep_tracking {
     impl_dep_tracking_hash_via_hash!(Option<Sanitizer>);
 
     impl_dep_tracking_hash_for_sortable_vec_of!(String);
+    impl_dep_tracking_hash_for_sortable_vec_of!(PathBuf);
     impl_dep_tracking_hash_for_sortable_vec_of!(CrateType);
     impl_dep_tracking_hash_for_sortable_vec_of!((String, lint::Level));
     impl_dep_tracking_hash_for_sortable_vec_of!((String, Option<String>,
@@ -2037,6 +2216,7 @@ mod tests {
     use lint;
     use middle::cstore;
     use session::config::{build_configuration, build_session_options_and_crate_config};
+    use session::config::Lto;
     use session::build_session;
     use std::collections::{BTreeMap, BTreeSet};
     use std::iter::FromIterator;
@@ -2482,7 +2662,7 @@ mod tests {
         opts.cg.ar = Some(String::from("abc"));
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
 
-        opts.cg.linker = Some(String::from("linker"));
+        opts.cg.linker = Some(PathBuf::from("linker"));
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
 
         opts.cg.link_args = Some(vec![String::from("abc"), String::from("def")]);
@@ -2507,10 +2687,13 @@ mod tests {
         opts.cg.save_temps = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
 
+        opts.cg.incremental = Some(String::from("abc"));
+        assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
+
 
         // Make sure changing a [TRACKED] option changes the hash
         opts = reference.clone();
-        opts.cg.lto = true;
+        opts.cg.lto = Lto::Fat;
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();
@@ -2618,8 +2801,6 @@ mod tests {
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.borrowck_stats = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-        opts.debugging_opts.debug_llvm = true;
-        assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.meta_stats = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.print_link_args = true;
@@ -2633,8 +2814,6 @@ mod tests {
         opts.debugging_opts.ls = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.save_analysis = true;
-        assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-        opts.debugging_opts.print_move_fragments = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.flowgraph_print_loans = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
@@ -2668,7 +2847,7 @@ mod tests {
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.dump_mir = Some(String::from("abc"));
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
-        opts.debugging_opts.dump_mir_dir = Some(String::from("abc"));
+        opts.debugging_opts.dump_mir_dir = String::from("abc");
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
         opts.debugging_opts.dump_mir_graphviz = true;
         assert_eq!(reference.dep_tracking_hash(), opts.dep_tracking_hash());
@@ -2684,6 +2863,10 @@ mod tests {
 
         opts = reference.clone();
         opts.debugging_opts.no_landing_pads = true;
+        assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
+
+        opts = reference.clone();
+        opts.debugging_opts.fewer_names = true;
         assert!(reference.dep_tracking_hash() != opts.dep_tracking_hash());
 
         opts = reference.clone();

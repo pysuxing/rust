@@ -11,7 +11,7 @@
 use std::fs;
 use std::env;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, exit};
 
 use Mode;
 use Compiler;
@@ -22,7 +22,6 @@ use native;
 use channel::GitInfo;
 use cache::Interned;
 use toolstate::ToolState;
-use build_helper::BuildExpectation;
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct CleanTools {
@@ -82,7 +81,7 @@ struct ToolBuild {
     tool: &'static str,
     path: &'static str,
     mode: Mode,
-    expectation: BuildExpectation,
+    is_ext_tool: bool,
 }
 
 impl Step for ToolBuild {
@@ -102,7 +101,7 @@ impl Step for ToolBuild {
         let target = self.target;
         let tool = self.tool;
         let path = self.path;
-        let expectation = self.expectation;
+        let is_ext_tool = self.is_ext_tool;
 
         match self.mode {
             Mode::Libstd => builder.ensure(compile::Std { compiler, target }),
@@ -115,15 +114,25 @@ impl Step for ToolBuild {
         println!("Building stage{} tool {} ({})", compiler.stage, tool, target);
 
         let mut cargo = prepare_tool_cargo(builder, compiler, target, "build", path);
-        build.run_expecting(&mut cargo, expectation);
-        if expectation == BuildExpectation::Succeeding || expectation == BuildExpectation::None {
+        let is_expected = build.try_run(&mut cargo);
+        build.save_toolstate(tool, if is_expected {
+            ToolState::TestFail
+        } else {
+            ToolState::BuildFail
+        });
+
+        if !is_expected {
+            if !is_ext_tool {
+                exit(1);
+            } else {
+                return None;
+            }
+        } else {
             let cargo_out = build.cargo_out(compiler, Mode::Tool, target)
                 .join(exe(tool, &compiler.host));
             let bin = build.tools_dir(compiler).join(exe(tool, &compiler.host));
             copy(&cargo_out, &bin);
             Some(bin)
-        } else {
-            None
         }
     }
 }
@@ -232,8 +241,8 @@ macro_rules! tool {
                     tool: $tool_name,
                     mode: $mode,
                     path: $path,
-                    expectation: BuildExpectation::None,
-                }).expect("expected to build -- BuildExpectation::None")
+                    is_ext_tool: false,
+                }).expect("expected to build -- essential tool")
             }
         }
         )+
@@ -280,8 +289,8 @@ impl Step for RemoteTestServer {
             tool: "remote-test-server",
             mode: Mode::Libstd,
             path: "src/tools/remote-test-server",
-            expectation: BuildExpectation::None,
-        }).expect("expected to build -- BuildExpectation::None")
+            is_ext_tool: false,
+        }).expect("expected to build -- essential tool")
     }
 }
 
@@ -398,8 +407,8 @@ impl Step for Cargo {
             tool: "cargo",
             mode: Mode::Librustc,
             path: "src/tools/cargo",
-            expectation: BuildExpectation::None,
-        }).expect("BuildExpectation::None - expected to build")
+            is_ext_tool: false,
+        }).expect("expected to build -- essential tool")
     }
 }
 
@@ -436,14 +445,13 @@ macro_rules! tool_extended {
 
             fn run($sel, $builder: &Builder) -> Option<PathBuf> {
                 $extra_deps
-                let toolstate = $builder.build.config.toolstate.$toolstate;
                 $builder.ensure(ToolBuild {
                     compiler: $sel.compiler,
                     target: $sel.target,
                     tool: $tool_name,
                     mode: Mode::Librustc,
                     path: $path,
-                    expectation: toolstate.passes(ToolState::Compiling),
+                    is_ext_tool: true,
                 })
             }
         }

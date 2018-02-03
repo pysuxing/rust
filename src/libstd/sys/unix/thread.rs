@@ -255,10 +255,7 @@ pub mod guard {
 
     pub unsafe fn init() -> Option<usize> {
         let psize = os::page_size();
-        let mut stackaddr = match get_stack_start() {
-            Some(addr) => addr,
-            None => return None,
-        };
+        let mut stackaddr = get_stack_start()?;
 
         // Ensure stackaddr is page aligned! A parent process might
         // have reset RLIMIT_STACK to be non-page aligned. The
@@ -314,8 +311,8 @@ pub mod guard {
 
     #[cfg(target_os = "macos")]
     pub unsafe fn current() -> Option<usize> {
-        Some((libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize -
-              libc::pthread_get_stacksize_np(libc::pthread_self())))
+        Some(libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize -
+             libc::pthread_get_stacksize_np(libc::pthread_self()))
     }
 
     #[cfg(any(target_os = "openbsd", target_os = "bitrig"))]

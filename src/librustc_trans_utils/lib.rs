@@ -29,16 +29,20 @@
 
 extern crate ar;
 extern crate flate2;
-extern crate owning_ref;
 #[macro_use]
 extern crate log;
 
 #[macro_use]
 extern crate rustc;
 extern crate rustc_back;
-extern crate rustc_data_structures;
+extern crate rustc_mir;
+extern crate rustc_incremental;
+#[macro_use]
 extern crate syntax;
 extern crate syntax_pos;
+extern crate rustc_data_structures;
+
+pub extern crate rustc as __rustc;
 
 use rustc::ty::{TyCtxt, Instance};
 use rustc::hir;
@@ -46,12 +50,11 @@ use rustc::hir::def_id::LOCAL_CRATE;
 use rustc::hir::map as hir_map;
 use rustc::util::nodemap::NodeSet;
 
-pub mod common;
+pub mod diagnostics;
 pub mod link;
-pub mod collector;
-pub mod trans_item;
-pub mod monomorphize;
 pub mod trans_crate;
+pub mod symbol_names;
+pub mod symbol_names_test;
 
 /// check for the #[rustc_error] annotation, which forces an
 /// error in trans. This is used to write compile-fail tests
@@ -108,10 +111,13 @@ pub fn find_exported_symbols<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) -> NodeSet {
                 (generics.parent_types == 0 && generics.types.is_empty()) &&
                 // Functions marked with #[inline] are only ever translated
                 // with "internal" linkage and are never exported.
-                !common::requests_inline(tcx, &Instance::mono(tcx, def_id))
+                !Instance::mono(tcx, def_id).def.requires_local(tcx)
             }
 
             _ => false
         }
     }).collect()
 }
+
+#[cfg(not(stage0))] // remove after the next snapshot
+__build_diagnostic_array! { librustc_trans_utils, DIAGNOSTICS }

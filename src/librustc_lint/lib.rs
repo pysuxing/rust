@@ -109,7 +109,6 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
                        AnonymousParameters,
                        IllegalFloatLiteralPattern,
                        UnusedDocComment,
-                       AutoImpl,
                        );
 
     add_early_builtin_with_new!(sess,
@@ -184,10 +183,6 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
     store.register_future_incompatible(sess,
                                        vec![
         FutureIncompatibleInfo {
-            id: LintId::of(AUTO_IMPL),
-            reference: "issue #13231 <https://github.com/rust-lang/rust/issues/13231>",
-        },
-        FutureIncompatibleInfo {
             id: LintId::of(PRIVATE_IN_PUBLIC),
             reference: "issue #34537 <https://github.com/rust-lang/rust/issues/34537>",
         },
@@ -242,6 +237,22 @@ pub fn register_builtins(store: &mut lint::LintStore, sess: Option<&Session>) {
         FutureIncompatibleInfo {
             id: LintId::of(LATE_BOUND_LIFETIME_ARGUMENTS),
             reference: "issue #42868 <https://github.com/rust-lang/rust/issues/42868>",
+        },
+        FutureIncompatibleInfo {
+            id: LintId::of(SAFE_PACKED_BORROWS),
+            reference: "issue #46043 <https://github.com/rust-lang/rust/issues/46043>",
+        },
+        FutureIncompatibleInfo {
+            id: LintId::of(INCOHERENT_FUNDAMENTAL_IMPLS),
+            reference: "issue #46205 <https://github.com/rust-lang/rust/issues/46205>",
+        },
+        FutureIncompatibleInfo {
+            id: LintId::of(COERCE_NEVER),
+            reference: "issue #46325 <https://github.com/rust-lang/rust/issues/46325>",
+        },
+        FutureIncompatibleInfo {
+            id: LintId::of(TYVAR_BEHIND_RAW_POINTER),
+            reference: "issue #46906 <https://github.com/rust-lang/rust/issues/46906>",
         },
         ]);
 

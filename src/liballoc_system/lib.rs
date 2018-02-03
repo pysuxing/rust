@@ -21,12 +21,11 @@
 #![feature(core_intrinsics)]
 #![feature(staged_api)]
 #![feature(rustc_attrs)]
-#![cfg_attr(any(unix, target_os = "redox"), feature(libc))]
+#![cfg_attr(any(unix, target_os = "cloudabi", target_os = "redox"), feature(libc))]
 #![rustc_alloc_kind = "lib"]
 
 // The minimum alignment guaranteed by the architecture. This value is used to
-// add fast paths for low alignment values. In practice, the alignment is a
-// constant at the call site and the branch will be optimized out.
+// add fast paths for low alignment values.
 #[cfg(all(any(target_arch = "x86",
               target_arch = "arm",
               target_arch = "mips",
@@ -117,7 +116,7 @@ unsafe impl Alloc for System {
     }
 }
 
-#[cfg(any(unix, target_os = "redox"))]
+#[cfg(any(unix, target_os = "cloudabi", target_os = "redox"))]
 mod platform {
     extern crate libc;
 
@@ -132,7 +131,7 @@ mod platform {
     unsafe impl<'a> Alloc for &'a System {
         #[inline]
         unsafe fn alloc(&mut self, layout: Layout) -> Result<*mut u8, AllocErr> {
-            let ptr = if layout.align() <= MIN_ALIGN {
+            let ptr = if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
                 libc::malloc(layout.size()) as *mut u8
             } else {
                 aligned_malloc(&layout)
@@ -148,7 +147,7 @@ mod platform {
         unsafe fn alloc_zeroed(&mut self, layout: Layout)
             -> Result<*mut u8, AllocErr>
         {
-            if layout.align() <= MIN_ALIGN {
+            if layout.align() <= MIN_ALIGN && layout.align() <= layout.size() {
                 let ptr = libc::calloc(layout.size(), 1) as *mut u8;
                 if !ptr.is_null() {
                     Ok(ptr)
@@ -180,7 +179,7 @@ mod platform {
                 })
             }
 
-            if new_layout.align() <= MIN_ALIGN {
+            if new_layout.align() <= MIN_ALIGN  && new_layout.align() <= new_layout.size(){
                 let ptr = libc::realloc(ptr as *mut libc::c_void, new_layout.size());
                 if !ptr.is_null() {
                     Ok(ptr as *mut u8)
@@ -214,6 +213,16 @@ mod platform {
             struct Stderr;
 
             impl Write for Stderr {
+                #[cfg(target_os = "cloudabi")]
+                fn write_str(&mut self, _: &str) -> fmt::Result {
+                    // CloudABI does not have any reserved file descriptor
+                    // numbers. We should not attempt to write to file
+                    // descriptor #2, as it may be associated with any kind of
+                    // resource.
+                    Ok(())
+                }
+
+                #[cfg(not(target_os = "cloudabi"))]
                 fn write_str(&mut self, s: &str) -> fmt::Result {
                     unsafe {
                         libc::write(libc::STDERR_FILENO,

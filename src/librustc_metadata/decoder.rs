@@ -18,9 +18,11 @@ use rustc::hir;
 use rustc::middle::cstore::{LinkagePreference, ExternConstBody,
                             ExternBodyNestedBodies};
 use rustc::hir::def::{self, Def, CtorKind};
-use rustc::hir::def_id::{CrateNum, DefId, DefIndex, CRATE_DEF_INDEX, LOCAL_CRATE};
+use rustc::hir::def_id::{CrateNum, DefId, DefIndex,
+                         CRATE_DEF_INDEX, LOCAL_CRATE};
 use rustc::ich::Fingerprint;
 use rustc::middle::lang_items;
+use rustc::mir;
 use rustc::session::Session;
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::codec::TyDecoder;
@@ -35,7 +37,6 @@ use std::rc::Rc;
 use std::u32;
 
 use rustc_serialize::{Decodable, Decoder, SpecializedDecoder, opaque};
-use rustc_data_structures::indexed_vec::Idx;
 use syntax::attr;
 use syntax::ast::{self, Ident};
 use syntax::codemap;
@@ -263,32 +264,28 @@ impl<'a, 'tcx> SpecializedDecoder<DefId> for DecodeContext<'a, 'tcx> {
 impl<'a, 'tcx> SpecializedDecoder<DefIndex> for DecodeContext<'a, 'tcx> {
     #[inline]
     fn specialized_decode(&mut self) -> Result<DefIndex, Self::Error> {
-        Ok(DefIndex::from_u32(self.read_u32()?))
+        Ok(DefIndex::from_raw_u32(self.read_u32()?))
     }
 }
 
 impl<'a, 'tcx> SpecializedDecoder<Span> for DecodeContext<'a, 'tcx> {
     fn specialized_decode(&mut self) -> Result<Span, Self::Error> {
+        let tag = u8::decode(self)?;
+
+        if tag == TAG_INVALID_SPAN {
+            return Ok(DUMMY_SP)
+        }
+
+        debug_assert_eq!(tag, TAG_VALID_SPAN);
+
         let lo = BytePos::decode(self)?;
-        let hi = BytePos::decode(self)?;
+        let len = BytePos::decode(self)?;
+        let hi = lo + len;
 
         let sess = if let Some(sess) = self.sess {
             sess
         } else {
             bug!("Cannot decode Span without Session.")
-        };
-
-        let (lo, hi) = if lo > hi {
-            // Currently macro expansion sometimes produces invalid Span values
-            // where lo > hi. In order not to crash the compiler when trying to
-            // translate these values, let's transform them into something we
-            // can handle (and which will produce useful debug locations at
-            // least some of the time).
-            // This workaround is only necessary as long as macro expansion is
-            // not fixed. FIXME(#23480)
-            (lo, lo)
-        } else {
-            (lo, hi)
         };
 
         let imported_filemaps = self.cdata().imported_filemaps(&sess.codemap());
@@ -298,9 +295,7 @@ impl<'a, 'tcx> SpecializedDecoder<Span> for DecodeContext<'a, 'tcx> {
             let last_filemap = &imported_filemaps[self.last_filemap_index];
 
             if lo >= last_filemap.original_start_pos &&
-               lo <= last_filemap.original_end_pos &&
-               hi >= last_filemap.original_start_pos &&
-               hi <= last_filemap.original_end_pos {
+               lo <= last_filemap.original_end_pos {
                 last_filemap
             } else {
                 let mut a = 0;
@@ -320,10 +315,32 @@ impl<'a, 'tcx> SpecializedDecoder<Span> for DecodeContext<'a, 'tcx> {
             }
         };
 
+        // Make sure our binary search above is correct.
+        debug_assert!(lo >= filemap.original_start_pos &&
+                      lo <= filemap.original_end_pos);
+
+        // Make sure we correctly filtered out invalid spans during encoding
+        debug_assert!(hi >= filemap.original_start_pos &&
+                      hi <= filemap.original_end_pos);
+
         let lo = (lo + filemap.translated_filemap.start_pos) - filemap.original_start_pos;
         let hi = (hi + filemap.translated_filemap.start_pos) - filemap.original_start_pos;
 
         Ok(Span::new(lo, hi, NO_EXPANSION))
+    }
+}
+
+impl<'a, 'tcx> SpecializedDecoder<Fingerprint> for DecodeContext<'a, 'tcx> {
+    fn specialized_decode(&mut self) -> Result<Fingerprint, Self::Error> {
+        Fingerprint::decode_opaque(&mut self.opaque)
+    }
+}
+
+impl<'a, 'tcx, T: Decodable> SpecializedDecoder<mir::ClearCrossCrate<T>>
+for DecodeContext<'a, 'tcx> {
+    #[inline]
+    fn specialized_decode(&mut self) -> Result<mir::ClearCrossCrate<T>, Self::Error> {
+        Ok(mir::ClearCrossCrate::Clear)
     }
 }
 
@@ -387,7 +404,6 @@ impl<'tcx> EntryKind<'tcx> {
 
             EntryKind::ForeignMod |
             EntryKind::Impl(_) |
-            EntryKind::AutoImpl(_) |
             EntryKind::Field |
             EntryKind::Generator(_) |
             EntryKind::Closure(_) => return None,
@@ -436,7 +452,7 @@ impl<'a, 'tcx> CrateMetadata {
         if !self.is_proc_macro(index) {
             self.entry(index).kind.to_def(self.local_def_id(index))
         } else {
-            let kind = self.proc_macros.as_ref().unwrap()[index.as_usize() - 1].1.kind();
+            let kind = self.proc_macros.as_ref().unwrap()[index.to_proc_macro_index()].1.kind();
             Some(Def::Macro(self.local_def_id(index), kind))
         }
     }
@@ -617,12 +633,18 @@ impl<'a, 'tcx> CrateMetadata {
                     let def = Def::Macro(
                         DefId {
                             krate: self.cnum,
-                            index: DefIndex::new(id + 1)
+                            index: DefIndex::from_proc_macro_index(id),
                         },
                         ext.kind()
                     );
                     let ident = Ident::with_empty_ctxt(name);
-                    callback(def::Export { ident: ident, def: def, span: DUMMY_SP });
+                    callback(def::Export {
+                        ident: ident,
+                        def: def,
+                        vis: ty::Visibility::Public,
+                        span: DUMMY_SP,
+                        is_import: false,
+                    });
                 }
             }
             return
@@ -659,14 +681,15 @@ impl<'a, 'tcx> CrateMetadata {
                                 callback(def::Export {
                                     def,
                                     ident: Ident::from_str(&self.item_name(child_index)),
+                                    vis: self.get_visibility(child_index),
                                     span: self.entry(child_index).span.decode((self, sess)),
+                                    is_import: false,
                                 });
                             }
                         }
                         continue;
                     }
-                    EntryKind::Impl(_) |
-                    EntryKind::AutoImpl(_) => continue,
+                    EntryKind::Impl(_) => continue,
 
                     _ => {}
                 }
@@ -676,15 +699,21 @@ impl<'a, 'tcx> CrateMetadata {
                 if let (Some(def), Some(name)) =
                     (self.get_def(child_index), def_key.disambiguated_data.data.get_opt_name()) {
                     let ident = Ident::from_str(&name);
-                    callback(def::Export { def: def, ident: ident, span: span });
-                    // For non-reexport structs and variants add their constructors to children.
-                    // Reexport lists automatically contain constructors when necessary.
+                    let vis = self.get_visibility(child_index);
+                    let is_import = false;
+                    callback(def::Export { def, ident, vis, span, is_import });
+                    // For non-re-export structs and variants add their constructors to children.
+                    // Re-export lists automatically contain constructors when necessary.
                     match def {
                         Def::Struct(..) => {
                             if let Some(ctor_def_id) = self.get_struct_ctor_def_id(child_index) {
                                 let ctor_kind = self.get_ctor_kind(child_index);
                                 let ctor_def = Def::StructCtor(ctor_def_id, ctor_kind);
-                                callback(def::Export { def: ctor_def, ident: ident, span: span });
+                                callback(def::Export {
+                                    def: ctor_def,
+                                    vis: self.get_visibility(ctor_def_id.index),
+                                    ident, span, is_import,
+                                });
                             }
                         }
                         Def::Variant(def_id) => {
@@ -692,7 +721,8 @@ impl<'a, 'tcx> CrateMetadata {
                             // value namespace, they are reserved for possible future use.
                             let ctor_kind = self.get_ctor_kind(child_index);
                             let ctor_def = Def::VariantCtor(def_id, ctor_kind);
-                            callback(def::Export { def: ctor_def, ident: ident, span: span });
+                            let vis = self.get_visibility(child_index);
+                            callback(def::Export { def: ctor_def, ident, vis, span, is_import });
                         }
                         _ => {}
                     }
@@ -749,7 +779,7 @@ impl<'a, 'tcx> CrateMetadata {
         } else {
             ExternBodyNestedBodies {
                 nested_bodies: Rc::new(BTreeMap::new()),
-                fingerprint: Fingerprint::zero(),
+                fingerprint: Fingerprint::ZERO,
             }
         }
     }
@@ -1013,13 +1043,6 @@ impl<'a, 'tcx> CrateMetadata {
         self.dllimport_foreign_items.contains(&id)
     }
 
-    pub fn is_auto_impl(&self, impl_id: DefIndex) -> bool {
-        match self.entry(impl_id).kind {
-            EntryKind::AutoImpl(_) => true,
-            _ => false,
-        }
-    }
-
     pub fn fn_sig(&self,
                   id: DefIndex,
                   tcx: TyCtxt<'a, 'tcx, 'tcx>)
@@ -1097,6 +1120,7 @@ impl<'a, 'tcx> CrateMetadata {
                                       lines,
                                       multibyte_chars,
                                       non_narrow_chars,
+                                      name_hash,
                                       .. } = filemap_to_import;
 
             let source_length = (end_pos - start_pos).to_usize();
@@ -1123,6 +1147,7 @@ impl<'a, 'tcx> CrateMetadata {
                                                                    name_was_remapped,
                                                                    self.cnum.as_u32(),
                                                                    src_hash,
+                                                                   name_hash,
                                                                    source_length,
                                                                    lines,
                                                                    multibyte_chars,

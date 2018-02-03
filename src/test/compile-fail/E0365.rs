@@ -13,8 +13,6 @@ mod foo {
 }
 
 pub use foo as foo2;
-//~^ ERROR `foo` is private, and cannot be reexported [E0365]
-//~| NOTE reexport of private `foo`
-//~| NOTE consider declaring type or module `foo` with `pub`
+//~^ ERROR `foo` is private, and cannot be re-exported [E0365]
 
 fn main() {}

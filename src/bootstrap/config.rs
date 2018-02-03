@@ -27,7 +27,6 @@ use util::exe;
 use cache::{INTERNER, Interned};
 use flags::Flags;
 pub use flags::Subcommand;
-use toolstate::ToolStates;
 
 /// Global configuration for the entire build and/or bootstrap.
 ///
@@ -76,7 +75,7 @@ pub struct Config {
     pub llvm_static_stdcpp: bool,
     pub llvm_link_shared: bool,
     pub llvm_targets: Option<String>,
-    pub llvm_experimental_targets: Option<String>,
+    pub llvm_experimental_targets: String,
     pub llvm_link_jobs: Option<u32>,
 
     // rust codegen options
@@ -87,10 +86,12 @@ pub struct Config {
     pub rust_debuginfo_lines: bool,
     pub rust_debuginfo_only_std: bool,
     pub rust_rpath: bool,
+    pub rustc_parallel_queries: bool,
     pub rustc_default_linker: Option<String>,
     pub rust_optimize_tests: bool,
     pub rust_debuginfo_tests: bool,
     pub rust_dist_src: bool,
+    pub rust_codegen_backends: Vec<Interned<String>>,
 
     pub build: Interned<String>,
     pub hosts: Vec<Interned<String>>,
@@ -106,12 +107,15 @@ pub struct Config {
     pub debug_jemalloc: bool,
     pub use_jemalloc: bool,
     pub backtrace: bool, // support for RUST_BACKTRACE
+    pub wasm_syscall: bool,
 
     // misc
     pub low_priority: bool,
     pub channel: String,
     pub quiet_tests: bool,
     pub test_miri: bool,
+    pub save_toolstates: Option<PathBuf>,
+
     // Fallback musl-root for all targets
     pub musl_root: Option<PathBuf>,
     pub prefix: Option<PathBuf>,
@@ -119,7 +123,6 @@ pub struct Config {
     pub docdir: Option<PathBuf>,
     pub bindir: Option<PathBuf>,
     pub libdir: Option<PathBuf>,
-    pub libdir_relative: Option<PathBuf>,
     pub mandir: Option<PathBuf>,
     pub codegen_tests: bool,
     pub nodejs: Option<PathBuf>,
@@ -131,8 +134,6 @@ pub struct Config {
     // These are either the stage0 downloaded binaries or the locally installed ones.
     pub initial_cargo: PathBuf,
     pub initial_rustc: PathBuf,
-
-    pub toolstate: ToolStates,
 }
 
 /// Per-target configuration stored in the global configuration structure.
@@ -264,6 +265,7 @@ struct Rust {
     debuginfo: Option<bool>,
     debuginfo_lines: Option<bool>,
     debuginfo_only_std: Option<bool>,
+    experimental_parallel_queries: Option<bool>,
     debug_jemalloc: Option<bool>,
     use_jemalloc: Option<bool>,
     backtrace: Option<bool>,
@@ -279,6 +281,9 @@ struct Rust {
     dist_src: Option<bool>,
     quiet_tests: Option<bool>,
     test_miri: Option<bool>,
+    save_toolstates: Option<String>,
+    codegen_backends: Option<Vec<String>>,
+    wasm_syscall: Option<bool>,
 }
 
 /// TOML representation of how each build target is configured.
@@ -317,6 +322,7 @@ impl Config {
         config.ignore_git = false;
         config.rust_dist_src = true;
         config.test_miri = false;
+        config.rust_codegen_backends = vec![INTERNER.intern_str("llvm")];
 
         config.on_fail = flags.on_fail;
         config.stage = flags.stage;
@@ -342,18 +348,6 @@ impl Config {
                 }
             }
         }).unwrap_or_else(|| TomlConfig::default());
-
-        let toolstate_toml_path = config.src.join("src/tools/toolstate.toml");
-        let parse_toolstate = || -> Result<_, Box<::std::error::Error>> {
-            let mut f = File::open(toolstate_toml_path)?;
-            let mut contents = String::new();
-            f.read_to_string(&mut contents)?;
-            Ok(toml::from_str(&contents)?)
-        };
-        config.toolstate = parse_toolstate().unwrap_or_else(|err| {
-            println!("failed to parse TOML configuration 'toolstate.toml': {}", err);
-            process::exit(2);
-        });
 
         let build = toml.build.clone().unwrap_or(Build::default());
         set(&mut config.build, build.build.clone().map(|x| INTERNER.intern_string(x)));
@@ -447,7 +441,8 @@ impl Config {
             set(&mut config.llvm_static_stdcpp, llvm.static_libstdcpp);
             set(&mut config.llvm_link_shared, llvm.link_shared);
             config.llvm_targets = llvm.targets.clone();
-            config.llvm_experimental_targets = llvm.experimental_targets.clone();
+            config.llvm_experimental_targets = llvm.experimental_targets.clone()
+                .unwrap_or("WebAssembly".to_string());
             config.llvm_link_jobs = llvm.link_jobs;
         }
 
@@ -470,8 +465,17 @@ impl Config {
             set(&mut config.rust_dist_src, rust.dist_src);
             set(&mut config.quiet_tests, rust.quiet_tests);
             set(&mut config.test_miri, rust.test_miri);
+            set(&mut config.wasm_syscall, rust.wasm_syscall);
+            config.rustc_parallel_queries = rust.experimental_parallel_queries.unwrap_or(false);
             config.rustc_default_linker = rust.default_linker.clone();
             config.musl_root = rust.musl_root.clone().map(PathBuf::from);
+            config.save_toolstates = rust.save_toolstates.clone().map(PathBuf::from);
+
+            if let Some(ref backends) = rust.codegen_backends {
+                config.rust_codegen_backends = backends.iter()
+                    .map(|s| INTERNER.intern_str(s))
+                    .collect();
+            }
 
             match rust.codegen_units {
                 Some(0) => config.rust_codegen_units = Some(num_cpus::get() as u32),

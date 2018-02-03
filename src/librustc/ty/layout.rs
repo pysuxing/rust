@@ -340,8 +340,8 @@ impl AddAssign for Size {
 
 /// Alignment of a type in bytes, both ABI-mandated and preferred.
 /// Each field is a power of two, giving the alignment a maximum
-/// value of 2^(2^8 - 1), which is limited by LLVM to a i32, with
-/// a maximum capacity of 2^31 - 1 or 2147483647.
+/// value of 2<sup>(2<sup>8</sup> - 1)</sup>, which is limited by LLVM to a i32, with
+/// a maximum capacity of 2<sup>31</sup> - 1 or 2147483647.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Align {
     abi: u8,
@@ -489,12 +489,25 @@ impl<'a, 'tcx> Integer {
 
         let wanted = align.abi();
         for &candidate in &[I8, I16, I32, I64, I128] {
-            let ty = Int(candidate, false);
-            if wanted == ty.align(dl).abi() && wanted == ty.size(dl).bytes() {
+            if wanted == candidate.align(dl).abi() && wanted == candidate.size().bytes() {
                 return Some(candidate);
             }
         }
         None
+    }
+
+    /// Find the largest integer with the given alignment or less.
+    pub fn approximate_abi_align<C: HasDataLayout>(cx: C, align: Align) -> Integer {
+        let dl = cx.data_layout();
+
+        let wanted = align.abi();
+        // FIXME(eddyb) maybe include I128 in the future, when it works everywhere.
+        for &candidate in &[I64, I32, I16] {
+            if wanted >= candidate.align(dl).abi() && wanted >= candidate.size().bytes() {
+                return candidate;
+            }
+        }
+        I8
     }
 
     /// Get the Integer type from an attr::IntType.
@@ -507,7 +520,7 @@ impl<'a, 'tcx> Integer {
             attr::SignedInt(IntTy::I32) | attr::UnsignedInt(UintTy::U32) => I32,
             attr::SignedInt(IntTy::I64) | attr::UnsignedInt(UintTy::U64) => I64,
             attr::SignedInt(IntTy::I128) | attr::UnsignedInt(UintTy::U128) => I128,
-            attr::SignedInt(IntTy::Is) | attr::UnsignedInt(UintTy::Us) => {
+            attr::SignedInt(IntTy::Isize) | attr::UnsignedInt(UintTy::Usize) => {
                 dl.ptr_sized_integer()
             }
         }
@@ -638,11 +651,13 @@ impl Scalar {
 }
 
 /// The first half of a fat pointer.
+///
 /// - For a trait object, this is the address of the box.
 /// - For a slice, this is the base address.
 pub const FAT_PTR_ADDR: usize = 0;
 
 /// The second half of a fat pointer.
+///
 /// - For a trait object, this is the address of the vtable.
 /// - For a slice, this is the length.
 pub const FAT_PTR_EXTRA: usize = 1;
@@ -758,11 +773,13 @@ pub enum Abi {
     Uninhabited,
     Scalar(Scalar),
     ScalarPair(Scalar, Scalar),
-    Vector,
+    Vector {
+        element: Scalar,
+        count: u64
+    },
     Aggregate {
         /// If true, the size is exact, otherwise it's only a lower bound.
         sized: bool,
-        packed: bool
     }
 }
 
@@ -773,19 +790,8 @@ impl Abi {
             Abi::Uninhabited |
             Abi::Scalar(_) |
             Abi::ScalarPair(..) |
-            Abi::Vector => false,
-            Abi::Aggregate { sized, .. } => !sized
-        }
-    }
-
-    /// Returns true if the fields of the layout are packed.
-    pub fn is_packed(&self) -> bool {
-        match *self {
-            Abi::Uninhabited |
-            Abi::Scalar(_) |
-            Abi::ScalarPair(..) |
-            Abi::Vector => false,
-            Abi::Aggregate { packed, .. } => packed
+            Abi::Vector { .. } => false,
+            Abi::Aggregate { sized } => !sized
         }
     }
 }
@@ -942,8 +948,8 @@ impl<'a, 'tcx> LayoutDetails {
             AlwaysSized,
             /// A univariant, the last field of which may be coerced to unsized.
             MaybeUnsized,
-            /// A univariant, but part of an enum.
-            EnumVariant(Integer),
+            /// A univariant, but with a prefix of an arbitrary size & alignment (e.g. enum tag).
+            Prefixed(Size, Align),
         }
         let univariant_uninterned = |fields: &[TyLayout], repr: &ReprOptions, kind| {
             let packed = repr.packed();
@@ -962,14 +968,11 @@ impl<'a, 'tcx> LayoutDetails {
             let mut inverse_memory_index: Vec<u32> = (0..fields.len() as u32).collect();
 
             // Anything with repr(C) or repr(packed) doesn't optimize.
-            let optimize = match kind {
-                StructKind::AlwaysSized |
-                StructKind::MaybeUnsized |
-                StructKind::EnumVariant(I8) => {
-                    (repr.flags & ReprFlags::IS_UNOPTIMISABLE).is_empty()
-                }
-                StructKind::EnumVariant(_) => false
-            };
+            let mut optimize = (repr.flags & ReprFlags::IS_UNOPTIMISABLE).is_empty();
+            if let StructKind::Prefixed(_, align) = kind {
+                optimize &= align.abi() == 1;
+            }
+
             if optimize {
                 let end = if let StructKind::MaybeUnsized = kind {
                     fields.len() - 1
@@ -987,7 +990,7 @@ impl<'a, 'tcx> LayoutDetails {
                             (!f.is_zst(), cmp::Reverse(f.align.abi()))
                         })
                     }
-                    StructKind::EnumVariant(_) => {
+                    StructKind::Prefixed(..) => {
                         optimizing.sort_by_key(|&x| fields[x as usize].align.abi());
                     }
                 }
@@ -1001,12 +1004,11 @@ impl<'a, 'tcx> LayoutDetails {
 
             let mut offset = Size::from_bytes(0);
 
-            if let StructKind::EnumVariant(discr) = kind {
-                offset = discr.size();
+            if let StructKind::Prefixed(prefix_size, prefix_align) = kind {
                 if !packed {
-                    let discr_align = discr.align(dl);
-                    align = align.max(discr_align);
+                    align = align.max(prefix_align);
                 }
+                offset = prefix_size.abi_align(prefix_align);
             }
 
             for &i in &inverse_memory_index {
@@ -1065,10 +1067,7 @@ impl<'a, 'tcx> LayoutDetails {
             }
 
             let size = min_size.abi_align(align);
-            let mut abi = Abi::Aggregate {
-                sized,
-                packed
-            };
+            let mut abi = Abi::Aggregate { sized };
 
             // Unpack newtype ABIs and find scalar pairs.
             if sized && size.bytes() > 0 {
@@ -1083,11 +1082,13 @@ impl<'a, 'tcx> LayoutDetails {
                         // We have exactly one non-ZST field.
                         (Some((i, field)), None, None) => {
                             // Field fills the struct and it has a scalar or scalar pair ABI.
-                            if offsets[i].bytes() == 0 && size == field.size {
+                            if offsets[i].bytes() == 0 &&
+                               align.abi() == field.align.abi() &&
+                               size == field.size {
                                 match field.abi {
-                                    // For plain scalars we can't unpack newtypes
-                                    // for `#[repr(C)]`, as that affects C ABIs.
-                                    Abi::Scalar(_) if optimize => {
+                                    // For plain scalars, or vectors of them, we can't unpack
+                                    // newtypes for `#[repr(C)]`, as that affects C ABIs.
+                                    Abi::Scalar(_) | Abi::Vector { .. } if optimize => {
                                         abi = field.abi.clone();
                                     }
                                     // But scalar pairs are Rust-specific and get
@@ -1240,10 +1241,7 @@ impl<'a, 'tcx> LayoutDetails {
                         stride: element.size,
                         count
                     },
-                    abi: Abi::Aggregate {
-                        sized: true,
-                        packed: false
-                    },
+                    abi: Abi::Aggregate { sized: true },
                     align: element.align,
                     size
                 })
@@ -1256,10 +1254,7 @@ impl<'a, 'tcx> LayoutDetails {
                         stride: element.size,
                         count: 0
                     },
-                    abi: Abi::Aggregate {
-                        sized: false,
-                        packed: false
-                    },
+                    abi: Abi::Aggregate { sized: false },
                     align: element.align,
                     size: Size::from_bytes(0)
                 })
@@ -1271,10 +1266,7 @@ impl<'a, 'tcx> LayoutDetails {
                         stride: Size::from_bytes(1),
                         count: 0
                     },
-                    abi: Abi::Aggregate {
-                        sized: false,
-                        packed: false
-                    },
+                    abi: Abi::Aggregate { sized: false },
                     align: dl.i8_align,
                     size: Size::from_bytes(0)
                 })
@@ -1288,7 +1280,7 @@ impl<'a, 'tcx> LayoutDetails {
                 let mut unit = univariant_uninterned(&[], &ReprOptions::default(),
                   StructKind::AlwaysSized)?;
                 match unit.abi {
-                    Abi::Aggregate { ref mut sized, .. } => *sized = false,
+                    Abi::Aggregate { ref mut sized } => *sized = false,
                     _ => bug!()
                 }
                 tcx.intern_layout(unit)
@@ -1322,16 +1314,17 @@ impl<'a, 'tcx> LayoutDetails {
 
             // SIMD vector types.
             ty::TyAdt(def, ..) if def.repr.simd() => {
-                let count = ty.simd_size(tcx) as u64;
                 let element = cx.layout_of(ty.simd_type(tcx))?;
-                match element.abi {
-                    Abi::Scalar(_) => {}
+                let count = ty.simd_size(tcx) as u64;
+                assert!(count > 0);
+                let scalar = match element.abi {
+                    Abi::Scalar(ref scalar) => scalar.clone(),
                     _ => {
                         tcx.sess.fatal(&format!("monomorphising SIMD type `{}` with \
                                                 a non-machine element type `{}`",
                                                 ty, element.ty));
                     }
-                }
+                };
                 let size = element.size.checked_mul(count, dl)
                     .ok_or(LayoutError::SizeOverflow(ty))?;
                 let align = dl.vector_align(size);
@@ -1343,7 +1336,10 @@ impl<'a, 'tcx> LayoutDetails {
                         stride: element.size,
                         count
                     },
-                    abi: Abi::Vector,
+                    abi: Abi::Vector {
+                        element: scalar,
+                        count
+                    },
                     size,
                     align,
                 })
@@ -1357,17 +1353,6 @@ impl<'a, 'tcx> LayoutDetails {
                         cx.layout_of(field.ty(tcx, substs))
                     }).collect::<Result<Vec<_>, _>>()
                 }).collect::<Result<Vec<_>, _>>()?;
-
-                let (inh_first, inh_second) = {
-                    let mut inh_variants = (0..variants.len()).filter(|&v| {
-                        variants[v].iter().all(|f| f.abi != Abi::Uninhabited)
-                    });
-                    (inh_variants.next(), inh_variants.next())
-                };
-                if inh_first.is_none() {
-                    // Uninhabited because it has no variants, or only uninhabited ones.
-                    return Ok(tcx.intern_layout(LayoutDetails::uninhabited(0)));
-                }
 
                 if def.is_union() {
                     let packed = def.repr.packed();
@@ -1400,13 +1385,21 @@ impl<'a, 'tcx> LayoutDetails {
                     return Ok(tcx.intern_layout(LayoutDetails {
                         variants: Variants::Single { index: 0 },
                         fields: FieldPlacement::Union(variants[0].len()),
-                        abi: Abi::Aggregate {
-                            sized: true,
-                            packed
-                        },
+                        abi: Abi::Aggregate { sized: true },
                         align,
                         size: size.abi_align(align)
                     }));
+                }
+
+                let (inh_first, inh_second) = {
+                    let mut inh_variants = (0..variants.len()).filter(|&v| {
+                        variants[v].iter().all(|f| f.abi != Abi::Uninhabited)
+                    });
+                    (inh_variants.next(), inh_variants.next())
+                };
+                if inh_first.is_none() {
+                    // Uninhabited because it has no variants, or only uninhabited ones.
+                    return Ok(tcx.intern_layout(LayoutDetails::uninhabited(0)));
                 }
 
                 let is_struct = !def.is_enum() ||
@@ -1493,31 +1486,25 @@ impl<'a, 'tcx> LayoutDetails {
                                     Some(niche) => niche,
                                     None => continue
                                 };
+                            let mut align = dl.aggregate_align;
                             let st = variants.iter().enumerate().map(|(j, v)| {
                                 let mut st = univariant_uninterned(v,
                                     &def.repr, StructKind::AlwaysSized)?;
                                 st.variants = Variants::Single { index: j };
+
+                                align = align.max(st.align);
+
                                 Ok(st)
                             }).collect::<Result<Vec<_>, _>>()?;
 
                             let offset = st[i].fields.offset(field_index) + offset;
-                            let LayoutDetails { size, mut align, .. } = st[i];
+                            let size = st[i].size;
 
-                            let mut niche_align = niche.value.align(dl);
                             let abi = if offset.bytes() == 0 && niche.value.size(dl) == size {
                                 Abi::Scalar(niche.clone())
                             } else {
-                                let mut packed = st[i].abi.is_packed();
-                                if offset.abi_align(niche_align) != offset {
-                                    packed = true;
-                                    niche_align = dl.i8_align;
-                                }
-                                Abi::Aggregate {
-                                    sized: true,
-                                    packed
-                                }
+                                Abi::Aggregate { sized: true }
                             };
-                            align = align.max(niche_align);
 
                             return Ok(tcx.intern_layout(LayoutDetails {
                                 variants: Variants::NicheFilling {
@@ -1558,10 +1545,24 @@ impl<'a, 'tcx> LayoutDetails {
                 let mut start_align = Align::from_bytes(256, 256).unwrap();
                 assert_eq!(Integer::for_abi_align(dl, start_align), None);
 
+                // repr(C) on an enum tells us to make a (tag, union) layout,
+                // so we need to grow the prefix alignment to be at least
+                // the alignment of the union. (This value is used both for
+                // determining the alignment of the overall enum, and the
+                // determining the alignment of the payload after the tag.)
+                let mut prefix_align = min_ity.align(dl);
+                if def.repr.c() {
+                    for fields in &variants {
+                        for field in fields {
+                            prefix_align = prefix_align.max(field.align);
+                        }
+                    }
+                }
+
                 // Create the set of structs that represent each variant.
                 let mut variants = variants.into_iter().enumerate().map(|(i, field_layouts)| {
                     let mut st = univariant_uninterned(&field_layouts,
-                        &def.repr, StructKind::EnumVariant(min_ity))?;
+                        &def.repr, StructKind::Prefixed(min_ity.size(), prefix_align))?;
                     st.variants = Variants::Single { index: i };
                     // Find the first field we can't move later
                     // to make room for a larger discriminant.
@@ -1649,20 +1650,17 @@ impl<'a, 'tcx> LayoutDetails {
                 let abi = if discr.value.size(dl) == size {
                     Abi::Scalar(discr.clone())
                 } else {
-                    Abi::Aggregate {
-                        sized: true,
-                        packed: false
-                    }
+                    Abi::Aggregate { sized: true }
                 };
                 tcx.intern_layout(LayoutDetails {
                     variants: Variants::Tagged {
                         discr,
                         variants
                     },
-                    // FIXME(eddyb): using `FieldPlacement::Arbitrary` here results
-                    // in lost optimizations, specifically around allocations, see
-                    // `test/codegen/{alloc-optimisation,vec-optimizes-away}.rs`.
-                    fields: FieldPlacement::Union(1),
+                    fields: FieldPlacement::Arbitrary {
+                        offsets: vec![Size::from_bytes(0)],
+                        memory_index: vec![0]
+                    },
                     abi,
                     align,
                     size
@@ -1680,7 +1678,7 @@ impl<'a, 'tcx> LayoutDetails {
             ty::TyParam(_) => {
                 return Err(LayoutError::Unknown(ty));
             }
-            ty::TyInfer(_) | ty::TyError => {
+            ty::TyGeneratorWitness(..) | ty::TyInfer(_) | ty::TyError => {
                 bug!("LayoutDetails::compute: unexpected type `{}`", ty)
             }
         })
@@ -2153,8 +2151,9 @@ impl<'a, 'tcx> TyLayout<'tcx> {
             ty::TyFnPtr(_) |
             ty::TyNever |
             ty::TyFnDef(..) |
-            ty::TyDynamic(..) |
-            ty::TyForeign(..) => {
+            ty::TyGeneratorWitness(..) |
+            ty::TyForeign(..) |
+            ty::TyDynamic(..) => {
                 bug!("TyLayout::field_type({:?}): not applicable", self)
             }
 
@@ -2245,18 +2244,14 @@ impl<'a, 'tcx> TyLayout<'tcx> {
         self.abi.is_unsized()
     }
 
-    /// Returns true if the fields of the layout are packed.
-    pub fn is_packed(&self) -> bool {
-        self.abi.is_packed()
-    }
-
     /// Returns true if the type is a ZST and not unsized.
     pub fn is_zst(&self) -> bool {
         match self.abi {
             Abi::Uninhabited => true,
-            Abi::Scalar(_) | Abi::ScalarPair(..) => false,
-            Abi::Vector => self.size.bytes() == 0,
-            Abi::Aggregate { sized, .. } => sized && self.size.bytes() == 0
+            Abi::Scalar(_) |
+            Abi::ScalarPair(..) |
+            Abi::Vector { .. } => false,
+            Abi::Aggregate { sized } => sized && self.size.bytes() == 0
         }
     }
 
@@ -2301,6 +2296,13 @@ impl<'a, 'tcx> TyLayout<'tcx> {
             }, niche_start))
         };
 
+        // Locals variables which live across yields are stored
+        // in the generator type as fields. These may be uninitialized
+        // so we don't look for niches there.
+        if let ty::TyGenerator(..) = self.ty.sty {
+            return Ok(None);
+        }
+
         match self.abi {
             Abi::Scalar(ref scalar) => {
                 return Ok(scalar_component(scalar, Size::from_bytes(0)));
@@ -2309,6 +2311,9 @@ impl<'a, 'tcx> TyLayout<'tcx> {
                 return Ok(scalar_component(a, Size::from_bytes(0)).or_else(|| {
                     scalar_component(b, a.value.size(cx).abi_align(b.value.align(cx)))
                 }));
+            }
+            Abi::Vector { ref element, .. } => {
+                return Ok(scalar_component(element, Size::from_bytes(0)));
             }
             _ => {}
         }
@@ -2412,9 +2417,11 @@ impl<'gcx> HashStable<StableHashingContext<'gcx>> for Abi {
                 a.hash_stable(hcx, hasher);
                 b.hash_stable(hcx, hasher);
             }
-            Vector => {}
-            Aggregate { packed, sized } => {
-                packed.hash_stable(hcx, hasher);
+            Vector { ref element, count } => {
+                element.hash_stable(hcx, hasher);
+                count.hash_stable(hcx, hasher);
+            }
+            Aggregate { sized } => {
                 sized.hash_stable(hcx, hasher);
             }
         }

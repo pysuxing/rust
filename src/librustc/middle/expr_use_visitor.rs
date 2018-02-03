@@ -558,24 +558,29 @@ impl<'a, 'gcx, 'tcx> ExprUseVisitor<'a, 'gcx, 'tcx> {
             }
             ty::TyError => { }
             _ => {
-                let def_id = self.mc.tables.type_dependent_defs()[call.hir_id].def_id();
-                let call_scope = region::Scope::Node(call.hir_id.local_id);
-                match OverloadedCallType::from_method_id(self.tcx(), def_id) {
-                    FnMutOverloadedCall => {
-                        let call_scope_r = self.tcx().mk_region(ty::ReScope(call_scope));
-                        self.borrow_expr(callee,
-                                         call_scope_r,
-                                         ty::MutBorrow,
-                                         ClosureInvocation);
+                if let Some(def) = self.mc.tables.type_dependent_defs().get(call.hir_id) {
+                    let def_id = def.def_id();
+                    let call_scope = region::Scope::Node(call.hir_id.local_id);
+                    match OverloadedCallType::from_method_id(self.tcx(), def_id) {
+                        FnMutOverloadedCall => {
+                            let call_scope_r = self.tcx().mk_region(ty::ReScope(call_scope));
+                            self.borrow_expr(callee,
+                                            call_scope_r,
+                                            ty::MutBorrow,
+                                            ClosureInvocation);
+                        }
+                        FnOverloadedCall => {
+                            let call_scope_r = self.tcx().mk_region(ty::ReScope(call_scope));
+                            self.borrow_expr(callee,
+                                            call_scope_r,
+                                            ty::ImmBorrow,
+                                            ClosureInvocation);
+                        }
+                        FnOnceOverloadedCall => self.consume_expr(callee),
                     }
-                    FnOverloadedCall => {
-                        let call_scope_r = self.tcx().mk_region(ty::ReScope(call_scope));
-                        self.borrow_expr(callee,
-                                         call_scope_r,
-                                         ty::ImmBorrow,
-                                         ClosureInvocation);
-                    }
-                    FnOnceOverloadedCall => self.consume_expr(callee),
+                } else {
+                    self.tcx().sess.delay_span_bug(call.span,
+                                                   "no type-dependent def for overloaded call");
                 }
             }
         }
@@ -658,7 +663,7 @@ impl<'a, 'gcx, 'tcx> ExprUseVisitor<'a, 'gcx, 'tcx> {
         match with_cmt.ty.sty {
             ty::TyAdt(adt, substs) if adt.is_struct() => {
                 // Consume those fields of the with expression that are needed.
-                for with_field in &adt.struct_variant().fields {
+                for with_field in &adt.non_enum_variant().fields {
                     if !contains_field_named(with_field, fields) {
                         let cmt_field = self.mc.cat_field(
                             &*with_expr,

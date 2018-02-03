@@ -48,12 +48,16 @@ pub enum Subcommand {
     Build {
         paths: Vec<PathBuf>,
     },
+    Check {
+        paths: Vec<PathBuf>,
+    },
     Doc {
         paths: Vec<PathBuf>,
     },
     Test {
         paths: Vec<PathBuf>,
         test_args: Vec<String>,
+        rustc_args: Vec<String>,
         fail_fast: bool,
     },
     Bench {
@@ -87,6 +91,7 @@ Usage: x.py <subcommand> [options] [<paths>...]
 
 Subcommands:
     build       Compile either the compiler or libraries
+    check       Compile either the compiler or libraries, using cargo check
     test        Build and run some test suites
     bench       Build and run some benchmarks
     doc         Build documentation
@@ -127,6 +132,7 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`");
         // there on out.
         let subcommand = args.iter().find(|&s|
             (s == "build")
+            || (s == "check")
             || (s == "test")
             || (s == "bench")
             || (s == "doc")
@@ -150,6 +156,12 @@ To learn more about a subcommand, run `./x.py <subcommand> -h`");
             "test"  => {
                 opts.optflag("", "no-fail-fast", "Run all tests regardless of failure");
                 opts.optmulti("", "test-args", "extra arguments", "ARGS");
+                opts.optmulti(
+                    "",
+                    "rustc-args",
+                    "extra options to pass the compiler when running tests",
+                    "ARGS",
+                );
             },
             "bench" => { opts.optmulti("", "test-args", "extra arguments", "ARGS"); },
             "clean" => { opts.optflag("", "all", "clean all build artifacts"); },
@@ -210,6 +222,21 @@ Arguments:
     arguments would), and then use the compiler built in stage 0 to build
     src/libtest and its dependencies.
     Once this is done, build/$ARCH/stage1 contains a usable compiler.");
+            }
+            "check" => {
+                subcommand_help.push_str("\n
+Arguments:
+    This subcommand accepts a number of paths to directories to the crates
+    and/or artifacts to compile. For example:
+
+        ./x.py check src/libcore
+        ./x.py check src/libcore src/libproc_macro
+
+    If no arguments are passed then the complete artifacts are compiled: std, test, and rustc. Note
+    also that since we use `cargo check`, by default this will automatically enable incremental
+    compilation, so there's no need to pass it separately, though it won't hurt. We also completely
+    ignore the stage passed, as there's no way to compile in non-stage 0 without actually building
+    the compiler.");
             }
             "test" => {
                 subcommand_help.push_str("\n
@@ -279,10 +306,14 @@ Arguments:
             "build" => {
                 Subcommand::Build { paths: paths }
             }
+            "check" => {
+                Subcommand::Check { paths: paths }
+            }
             "test" => {
                 Subcommand::Test {
                     paths,
                     test_args: matches.opt_strs("test-args"),
+                    rustc_args: matches.opt_strs("rustc-args"),
                     fail_fast: !matches.opt_present("no-fail-fast"),
                 }
             }
@@ -357,6 +388,15 @@ impl Subcommand {
             Subcommand::Test { ref test_args, .. } |
             Subcommand::Bench { ref test_args, .. } => {
                 test_args.iter().flat_map(|s| s.split_whitespace()).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn rustc_args(&self) -> Vec<&str> {
+        match *self {
+            Subcommand::Test { ref rustc_args, .. } => {
+                rustc_args.iter().flat_map(|s| s.split_whitespace()).collect()
             }
             _ => Vec::new(),
         }

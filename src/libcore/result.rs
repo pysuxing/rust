@@ -153,12 +153,12 @@
 //! }
 //! ```
 //!
-//! # The `?` syntax
+//! # The question mark operator, `?`
 //!
 //! When writing code that calls many functions that return the
-//! [`Result`] type, the error handling can be tedious. The [`?`]
-//! syntax hides some of the boilerplate of propagating errors up the
-//! call stack.
+//! [`Result`] type, the error handling can be tedious. The question mark
+//! operator, [`?`], hides some of the boilerplate of propagating errors
+//! up the call stack.
 //!
 //! It replaces this:
 //!
@@ -625,8 +625,13 @@ impl<T, E> Result<T, E> {
 
     /// Returns `res` if the result is [`Err`], otherwise returns the [`Ok`] value of `self`.
     ///
+    /// Arguments passed to `or` are eagerly evaluated; if you are passing the
+    /// result of a function call, it is recommended to use [`or_else`], which is
+    /// lazily evaluated.
+    ///
     /// [`Ok`]: enum.Result.html#variant.Ok
     /// [`Err`]: enum.Result.html#variant.Err
+    /// [`or_else`]: #method.or_else
     ///
     /// # Examples
     ///
@@ -690,8 +695,13 @@ impl<T, E> Result<T, E> {
     /// Unwraps a result, yielding the content of an [`Ok`].
     /// Else, it returns `optb`.
     ///
+    /// Arguments passed to `unwrap_or` are eagerly evaluated; if you are passing
+    /// the result of a function call, it is recommended to use [`unwrap_or_else`],
+    /// which is lazily evaluated.
+    ///
     /// [`Ok`]: enum.Result.html#variant.Ok
     /// [`Err`]: enum.Result.html#variant.Err
+    /// [`unwrap_or_else`]: #method.unwrap_or_else
     ///
     /// # Examples
     ///
@@ -895,6 +905,35 @@ impl<T: Default, E> Result<T, E> {
         match self {
             Ok(x) => x,
             Err(_) => Default::default(),
+        }
+    }
+}
+
+impl<T, E> Result<Option<T>, E> {
+    /// Transposes a `Result` of an `Option` into an `Option` of a `Result`.
+    ///
+    /// `Ok(None)` will be mapped to `None`.
+    /// `Ok(Some(_))` and `Err(_)` will be mapped to `Some(Ok(_))` and `Some(Err(_))`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(transpose_result)]
+    ///
+    /// #[derive(Debug, Eq, PartialEq)]
+    /// struct SomeErr;
+    ///
+    /// let x: Result<Option<i32>, SomeErr> = Ok(Some(5));
+    /// let y: Option<Result<i32, SomeErr>> = Some(Ok(5));
+    /// assert_eq!(x.transpose(), y);
+    /// ```
+    #[inline]
+    #[unstable(feature = "transpose_result", issue = "47338")]
+    pub fn transpose(self) -> Option<Result<T, E>> {
+        match self {
+            Ok(Some(x)) => Some(Ok(x)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
         }
     }
 }

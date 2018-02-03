@@ -93,7 +93,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
         let end = cm.lookup_char_pos(span.hi());
 
         SpanData {
-            file_name: start.file.name.clone().into(),
+            file_name: start.file.name.clone().to_string().into(),
             byte_start: span.lo().0,
             byte_end: span.hi().0,
             line_start: Row::new_one_indexed(start.line as u32),
@@ -117,6 +117,8 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
             };
             let lo_loc = self.span_utils.sess.codemap().lookup_char_pos(span.lo());
             result.push(ExternalCrateData {
+                // FIXME: change file_name field to PathBuf in rls-data
+                // https://github.com/nrc/rls-data/issues/7
                 file_name: SpanUtils::make_path_string(&lo_loc.file.name),
                 num: n.as_u32(),
                 id: GlobalCrateId {
@@ -271,7 +273,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
                     name: item.ident.to_string(),
                     qualname,
                     span: self.span_from_span(sub_span.unwrap()),
-                    value: filename,
+                    value: filename.to_string(),
                     parent: None,
                     children: m.items
                         .iter()
@@ -526,7 +528,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
                 };
                 match self.tables.expr_ty_adjusted(&hir_node).sty {
                     ty::TyAdt(def, _) if !def.is_enum() => {
-                        let f = def.struct_variant().field_named(ident.node.name);
+                        let f = def.non_enum_variant().field_named(ident.node.name);
                         let sub_span = self.span_utils.span_for_last_ident(expr.span);
                         filter!(self.span_utils, sub_span, expr.span, None);
                         let span = self.span_from_span(sub_span.unwrap());
@@ -719,6 +721,7 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
             HirDef::Enum(def_id) |
             HirDef::TyAlias(def_id) |
             HirDef::TyForeign(def_id) |
+            HirDef::TraitAlias(def_id) |
             HirDef::AssociatedTy(def_id) |
             HirDef::Trait(def_id) |
             HirDef::TyParam(def_id) => {
@@ -883,21 +886,15 @@ impl<'l, 'tcx: 'l> SaveContext<'l, 'tcx> {
 
 fn make_signature(decl: &ast::FnDecl, generics: &ast::Generics) -> String {
     let mut sig = "fn ".to_owned();
-    if !generics.lifetimes.is_empty() || !generics.ty_params.is_empty() {
+    if !generics.params.is_empty() {
         sig.push('<');
         sig.push_str(&generics
-            .lifetimes
+            .params
             .iter()
-            .map(|l| l.lifetime.ident.name.to_string())
-            .collect::<Vec<_>>()
-            .join(", "));
-        if !generics.lifetimes.is_empty() {
-            sig.push_str(", ");
-        }
-        sig.push_str(&generics
-            .ty_params
-            .iter()
-            .map(|l| l.ident.to_string())
+            .map(|param| match *param {
+                ast::GenericParam::Lifetime(ref l) => l.lifetime.ident.name.to_string(),
+                ast::GenericParam::Type(ref t) => t.ident.to_string(),
+            })
             .collect::<Vec<_>>()
             .join(", "));
         sig.push_str("> ");
@@ -1080,21 +1077,21 @@ pub fn process_crate<'l, 'tcx, H: SaveHandler>(
     config: Option<Config>,
     mut handler: H,
 ) {
-    let _ignore = tcx.dep_graph.in_ignore();
+    tcx.dep_graph.with_ignore(|| {
+        assert!(analysis.glob_map.is_some());
 
-    assert!(analysis.glob_map.is_some());
+        info!("Dumping crate {}", cratename);
 
-    info!("Dumping crate {}", cratename);
+        let save_ctxt = SaveContext {
+            tcx,
+            tables: &ty::TypeckTables::empty(None),
+            analysis,
+            span_utils: SpanUtils::new(&tcx.sess),
+            config: find_config(config),
+        };
 
-    let save_ctxt = SaveContext {
-        tcx,
-        tables: &ty::TypeckTables::empty(None),
-        analysis,
-        span_utils: SpanUtils::new(&tcx.sess),
-        config: find_config(config),
-    };
-
-    handler.save(save_ctxt, krate, cratename)
+        handler.save(save_ctxt, krate, cratename)
+    })
 }
 
 fn find_config(supplied: Option<Config>) -> Config {
@@ -1126,7 +1123,7 @@ fn generated_code(span: Span) -> bool {
 fn id_from_def_id(id: DefId) -> rls_data::Id {
     rls_data::Id {
         krate: id.krate.as_u32(),
-        index: id.index.as_u32(),
+        index: id.index.as_raw_u32(),
     }
 }
 

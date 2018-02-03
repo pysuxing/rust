@@ -13,7 +13,7 @@
 //!
 //! Mathematically significant numbers are provided in the `consts` sub-module.
 //!
-//! *[See also the `f32` primitive type](../primitive.f32.html).*
+//! *[See also the `f32` primitive type](../../std/primitive.f32.html).*
 
 #![stable(feature = "rust1", since = "1.0.0")]
 #![allow(missing_docs)]
@@ -472,20 +472,19 @@ impl f32 {
 
     /// Returns the logarithm of the number with respect to an arbitrary base.
     ///
+    /// The result may not be correctly rounded owing to implementation details;
+    /// `self.log2()` can produce more accurate results for base 2, and
+    /// `self.log10()` can produce more accurate results for base 10.
+    ///
     /// ```
     /// use std::f32;
     ///
-    /// let ten = 10.0f32;
-    /// let two = 2.0f32;
+    /// let five = 5.0f32;
     ///
-    /// // log10(10) - 1 == 0
-    /// let abs_difference_10 = (ten.log(10.0) - 1.0).abs();
+    /// // log5(5) - 1 == 0
+    /// let abs_difference = (five.log(5.0) - 1.0).abs();
     ///
-    /// // log2(2) - 1 == 0
-    /// let abs_difference_2 = (two.log(2.0) - 1.0).abs();
-    ///
-    /// assert!(abs_difference_10 <= f32::EPSILON);
-    /// assert!(abs_difference_2 <= f32::EPSILON);
+    /// assert!(abs_difference <= f32::EPSILON);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[inline]
@@ -1016,7 +1015,7 @@ impl f32 {
     #[stable(feature = "float_bits_conv", since = "1.20.0")]
     #[inline]
     pub fn to_bits(self) -> u32 {
-        unsafe { ::mem::transmute(self) }
+        num::Float::to_bits(self)
     }
 
     /// Raw transmutation from `u32`.
@@ -1060,8 +1059,7 @@ impl f32 {
     #[stable(feature = "float_bits_conv", since = "1.20.0")]
     #[inline]
     pub fn from_bits(v: u32) -> Self {
-        // It turns out the safety issues with sNaN were overblown! Hooray!
-        unsafe { ::mem::transmute(v) }
+        num::Float::from_bits(v)
     }
 }
 

@@ -17,7 +17,7 @@ use ty::{BrAnon, BrEnv, BrFresh, BrNamed};
 use ty::{TyBool, TyChar, TyAdt};
 use ty::{TyError, TyStr, TyArray, TySlice, TyFloat, TyFnDef, TyFnPtr};
 use ty::{TyParam, TyRawPtr, TyRef, TyNever, TyTuple};
-use ty::{TyClosure, TyGenerator, TyForeign, TyProjection, TyAnon};
+use ty::{TyClosure, TyGenerator, TyGeneratorWitness, TyForeign, TyProjection, TyAnon};
 use ty::{TyDynamic, TyInt, TyUint, TyInfer};
 use ty::{self, Ty, TyCtxt, TypeFoldable};
 use util::nodemap::FxHashSet;
@@ -632,6 +632,22 @@ impl<'tcx> fmt::Debug for ty::UpvarBorrow<'tcx> {
 }
 
 define_print! {
+    ('tcx) &'tcx ty::Slice<Ty<'tcx>>, (self, f, cx) {
+        display {
+            write!(f, "{{")?;
+            let mut tys = self.iter();
+            if let Some(&ty) = tys.next() {
+                print!(f, cx, print(ty))?;
+                for &ty in tys {
+                    print!(f, cx, write(", "), print(ty))?;
+                }
+            }
+            write!(f, "}}")
+        }
+    }
+}
+
+define_print! {
     ('tcx) ty::TypeAndMut<'tcx>, (self, f, cx) {
         display {
             print!(f, cx,
@@ -733,6 +749,9 @@ define_print! {
                 ty::ReErased => Ok(()),
                 ty::ReStatic => write!(f, "'static"),
                 ty::ReEmpty => write!(f, "'<empty>"),
+
+                // The user should never encounter these in unsubstituted form.
+                ty::ReClosureBound(vid) => write!(f, "{:?}", vid),
             }
         }
         debug {
@@ -741,6 +760,11 @@ define_print! {
                     write!(f, "ReEarlyBound({}, {})",
                            data.index,
                            data.name)
+                }
+
+                ty::ReClosureBound(ref vid) => {
+                    write!(f, "ReClosureBound({:?})",
+                           vid)
                 }
 
                 ty::ReLateBound(binder_id, ref bound_region) => {
@@ -857,13 +881,17 @@ impl fmt::Debug for ty::RegionVid {
 define_print! {
     () ty::InferTy, (self, f, cx) {
         display {
-            match *self {
-                ty::TyVar(_) => write!(f, "_"),
-                ty::IntVar(_) => write!(f, "{}", "{integer}"),
-                ty::FloatVar(_) => write!(f, "{}", "{float}"),
-                ty::FreshTy(v) => write!(f, "FreshTy({})", v),
-                ty::FreshIntTy(v) => write!(f, "FreshIntTy({})", v),
-                ty::FreshFloatTy(v) => write!(f, "FreshFloatTy({})", v)
+            if cx.is_verbose {
+                print!(f, cx, print_debug(self))
+            } else {
+                match *self {
+                    ty::TyVar(_) => write!(f, "_"),
+                    ty::IntVar(_) => write!(f, "{}", "{integer}"),
+                    ty::FloatVar(_) => write!(f, "{}", "{float}"),
+                    ty::FreshTy(v) => write!(f, "FreshTy({})", v),
+                    ty::FreshIntTy(v) => write!(f, "FreshIntTy({})", v),
+                    ty::FreshFloatTy(v) => write!(f, "FreshFloatTy({})", v)
+                }
             }
         }
         debug {
@@ -1054,7 +1082,11 @@ define_print! {
                 TyStr => write!(f, "str"),
                 TyGenerator(did, substs, interior) => ty::tls::with(|tcx| {
                     let upvar_tys = substs.upvar_tys(did, tcx);
-                    write!(f, "[generator")?;
+                    if interior.movable {
+                        write!(f, "[generator")?;
+                    } else {
+                        write!(f, "[static generator")?;
+                    }
 
                     if let Some(node_id) = tcx.hir.as_local_node_id(did) {
                         write!(f, "@{:?}", tcx.hir.span(node_id))?;
@@ -1085,6 +1117,9 @@ define_print! {
 
                     print!(f, cx, write(" "), print(interior), write("]"))
                 }),
+                TyGeneratorWitness(types) => {
+                    ty::tls::with(|tcx| cx.in_binder(f, tcx, &types, tcx.lift(&types)))
+                }
                 TyClosure(did, substs) => ty::tls::with(|tcx| {
                     let upvar_tys = substs.upvar_tys(did, tcx);
                     write!(f, "[closure")?;

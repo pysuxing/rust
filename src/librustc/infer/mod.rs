@@ -18,10 +18,10 @@ pub use ty::IntVarValue;
 pub use self::freshen::TypeFreshener;
 
 use hir::def_id::DefId;
-use middle::free_region::{FreeRegionMap, RegionRelations};
+use middle::free_region::RegionRelations;
 use middle::region;
 use middle::lang_items;
-use mir::tcx::LvalueTy;
+use mir::tcx::PlaceTy;
 use ty::subst::{Kind, Subst, Substs};
 use ty::{TyVid, IntVid, FloatVid};
 use ty::{self, Ty, TyCtxt};
@@ -44,9 +44,11 @@ use self::higher_ranked::HrMatchResult;
 use self::region_constraints::{RegionConstraintCollector, RegionSnapshot};
 use self::region_constraints::{GenericKind, VerifyBound, RegionConstraintData, VarOrigins};
 use self::lexical_region_resolve::LexicalRegionResolutions;
+use self::outlives::env::OutlivesEnvironment;
 use self::type_variable::TypeVariableOrigin;
 use self::unify_key::ToType;
 
+pub mod anon_types;
 pub mod at;
 mod combine;
 mod equate;
@@ -58,14 +60,12 @@ pub mod lattice;
 mod lub;
 pub mod region_constraints;
 mod lexical_region_resolve;
-mod outlives;
+pub mod outlives;
 pub mod resolve;
 mod freshen;
 mod sub;
 pub mod type_variable;
 pub mod unify_key;
-
-pub use self::outlives::env::OutlivesEnvironment;
 
 #[must_use]
 pub struct InferOk<'tcx, T> {
@@ -518,15 +518,15 @@ impl_trans_normalize!('gcx,
     ty::ExistentialTraitRef<'gcx>
 );
 
-impl<'gcx> TransNormalize<'gcx> for LvalueTy<'gcx> {
+impl<'gcx> TransNormalize<'gcx> for PlaceTy<'gcx> {
     fn trans_normalize<'a, 'tcx>(&self,
                                  infcx: &InferCtxt<'a, 'gcx, 'tcx>,
                                  param_env: ty::ParamEnv<'tcx>)
                                  -> Self {
         match *self {
-            LvalueTy::Ty { ty } => LvalueTy::Ty { ty: ty.trans_normalize(infcx, param_env) },
-            LvalueTy::Downcast { adt_def, substs, variant_index } => {
-                LvalueTy::Downcast {
+            PlaceTy::Ty { ty } => PlaceTy::Ty { ty: ty.trans_normalize(infcx, param_env) },
+            PlaceTy::Downcast { adt_def, substs, variant_index } => {
+                PlaceTy::Downcast {
                     adt_def,
                     substs: substs.trans_normalize(infcx, param_env),
                     variant_index,
@@ -1063,6 +1063,11 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         self.tcx.mk_region(ty::ReVar(self.borrow_region_constraints().new_region_var(origin)))
     }
 
+    /// Number of region variables created so far.
+    pub fn num_region_vars(&self) -> usize {
+        self.borrow_region_constraints().var_origins().len()
+    }
+
     /// Just a convenient wrapper of `next_region_var` for using during NLL.
     pub fn next_nll_region_var(&self, origin: NLLRegionVariableOrigin)
                                -> ty::Region<'tcx> {
@@ -1154,10 +1159,45 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     /// result. After this, no more unification operations should be
     /// done -- or the compiler will panic -- but it is legal to use
     /// `resolve_type_vars_if_possible` as well as `fully_resolve`.
-    pub fn resolve_regions_and_report_errors(&self,
-                                             region_context: DefId,
-                                             region_map: &region::ScopeTree,
-                                             free_regions: &FreeRegionMap<'tcx>) {
+    pub fn resolve_regions_and_report_errors(
+        &self,
+        region_context: DefId,
+        region_map: &region::ScopeTree,
+        outlives_env: &OutlivesEnvironment<'tcx>,
+    ) {
+        self.resolve_regions_and_report_errors_inner(
+            region_context,
+            region_map,
+            outlives_env,
+            false,
+        )
+    }
+
+    /// Like `resolve_regions_and_report_errors`, but skips error
+    /// reporting if NLL is enabled.  This is used for fn bodies where
+    /// the same error may later be reported by the NLL-based
+    /// inference.
+    pub fn resolve_regions_and_report_errors_unless_nll(
+        &self,
+        region_context: DefId,
+        region_map: &region::ScopeTree,
+        outlives_env: &OutlivesEnvironment<'tcx>,
+    ) {
+        self.resolve_regions_and_report_errors_inner(
+            region_context,
+            region_map,
+            outlives_env,
+            true,
+        )
+    }
+
+    fn resolve_regions_and_report_errors_inner(
+        &self,
+        region_context: DefId,
+        region_map: &region::ScopeTree,
+        outlives_env: &OutlivesEnvironment<'tcx>,
+        will_later_be_reported_by_nll: bool,
+    ) {
         assert!(self.is_tainted_by_errors() || self.region_obligations.borrow().is_empty(),
                 "region_obligations not empty: {:#?}",
                 self.region_obligations.borrow());
@@ -1165,7 +1205,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         let region_rels = &RegionRelations::new(self.tcx,
                                                 region_context,
                                                 region_map,
-                                                free_regions);
+                                                outlives_env.free_region_map());
         let (var_origins, data) = self.region_constraints.borrow_mut()
                                                          .take()
                                                          .expect("regions already resolved")
@@ -1182,7 +1222,7 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             // this infcx was in use.  This is totally hokey but
             // otherwise we have a hard time separating legit region
             // errors from silly ones.
-            self.report_region_errors(region_map, &errors); // see error_reporting module
+            self.report_region_errors(region_map, &errors, will_later_be_reported_by_nll);
         }
     }
 
@@ -1197,6 +1237,10 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
     /// translate them into the form that the NLL solver
     /// understands. See the NLL module for mode details.
     pub fn take_and_reset_region_constraints(&self) -> RegionConstraintData<'tcx> {
+        assert!(self.region_obligations.borrow().is_empty(),
+                "region_obligations not empty: {:#?}",
+                self.region_obligations.borrow());
+
         self.borrow_region_constraints().take_and_reset_data()
     }
 
@@ -1476,38 +1520,18 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         closure_kind_ty.to_opt_closure_kind()
     }
 
-    /// Obtain the signature of a function or closure.
-    /// For closures, unlike `tcx.fn_sig(def_id)`, this method will
-    /// work during the type-checking of the enclosing function and
-    /// return the closure signature in its partially inferred state.
-    pub fn fn_sig(&self, def_id: DefId) -> ty::PolyFnSig<'tcx> {
-        // Do we have an in-progress set of tables we are inferring?
-        if let Some(tables) = self.in_progress_tables {
-            // Is this a local item?
-            if let Some(id) = self.tcx.hir.as_local_node_id(def_id) {
-                // Is it a local *closure*?
-                if self.tcx.is_closure(def_id) {
-                    let hir_id = self.tcx.hir.node_to_hir_id(id);
-                    // Is this local closure contained within the tables we are inferring?
-                    if tables.borrow().local_id_root == Some(DefId::local(hir_id.owner)) {
-                        // if so, extract signature from there.
-                        let closure_ty = tables.borrow().node_id_to_type(hir_id);
-                        let (closure_def_id, closure_substs) = match closure_ty.sty {
-                            ty::TyClosure(closure_def_id, closure_substs) =>
-                                (closure_def_id, closure_substs),
-                            _ =>
-                                bug!("closure with non-closure type: {:?}", closure_ty),
-                        };
-                        assert_eq!(def_id, closure_def_id);
-                        let closure_sig_ty = closure_substs.closure_sig_ty(def_id, self.tcx);
-                        let closure_sig_ty = self.shallow_resolve(&closure_sig_ty);
-                        return closure_sig_ty.fn_sig(self.tcx);
-                    }
-                }
-            }
-        }
-
-        self.tcx.fn_sig(def_id)
+    /// Obtain the signature of a closure.  For closures, unlike
+    /// `tcx.fn_sig(def_id)`, this method will work during the
+    /// type-checking of the enclosing function and return the closure
+    /// signature in its partially inferred state.
+    pub fn closure_sig(
+        &self,
+        def_id: DefId,
+        substs: ty::ClosureSubsts<'tcx>
+    ) -> ty::PolyFnSig<'tcx> {
+        let closure_sig_ty = substs.closure_sig_ty(def_id, self.tcx);
+        let closure_sig_ty = self.shallow_resolve(&closure_sig_ty);
+        closure_sig_ty.fn_sig(self.tcx)
     }
 
     /// Normalizes associated types in `value`, potentially returning

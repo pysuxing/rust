@@ -23,11 +23,11 @@ use middle::cstore::{NativeLibraryKind, DepKind, CrateSource, ExternConstBody};
 use middle::privacy::AccessLevels;
 use middle::reachable::ReachableSet;
 use middle::region;
-use middle::resolve_lifetime::{Region, ObjectLifetimeDefault};
+use middle::resolve_lifetime::{ResolveLifetimes, Region, ObjectLifetimeDefault};
 use middle::stability::{self, DeprecationEntry};
 use middle::lang_items::{LanguageItems, LangItem};
 use middle::exported_symbols::SymbolExportLevel;
-use middle::trans::{CodegenUnit, Stats};
+use mir::mono::{CodegenUnit, Stats};
 use mir;
 use session::{CompileResult, CrateDisambiguator};
 use session::config::OutputFilenames;
@@ -37,7 +37,7 @@ use ty::{self, CrateInherentImpls, Ty, TyCtxt};
 use ty::steal::Steal;
 use ty::subst::Substs;
 use util::nodemap::{DefIdSet, DefIdMap, ItemLocalSet};
-use util::common::{profq_msg, ProfileQueriesMsg};
+use util::common::{profq_msg, ErrorReported, ProfileQueriesMsg};
 
 use rustc_data_structures::indexed_set::IdxSetBuf;
 use rustc_back::PanicStrategy;
@@ -112,9 +112,6 @@ define_maps! { <'tcx>
     /// True if this is a foreign item (i.e., linked via `extern { ... }`).
     [] fn is_foreign_item: IsForeignItem(DefId) -> bool,
 
-    /// True if this is an auto impl (aka impl Foo for ..)
-    [] fn is_auto_impl: IsAutoImpl(DefId) -> bool,
-
     /// Get a map with the variance of every item; use `item_variance`
     /// instead.
     [] fn crate_variances: crate_variances(CrateNum) -> Rc<ty::CrateVariancesMap>,
@@ -169,6 +166,9 @@ define_maps! { <'tcx>
     /// The result of unsafety-checking this def-id.
     [] fn unsafety_check_result: UnsafetyCheckResult(DefId) -> mir::UnsafetyCheckResult,
 
+    /// HACK: when evaluated, this reports a "unsafe derive on repr(packed)" error
+    [] fn unsafe_derive_on_repr_packed: UnsafeDeriveOnReprPacked(DefId) -> (),
+
     /// The signature of functions and closures.
     [] fn fn_sig: FnSignature(DefId) -> ty::PolyFnSig<'tcx>,
 
@@ -184,11 +184,13 @@ define_maps! { <'tcx>
 
     [] fn has_typeck_tables: HasTypeckTables(DefId) -> bool,
 
-    [] fn coherent_trait: coherent_trait_dep_node((CrateNum, DefId)) -> (),
+    [] fn coherent_trait: CoherenceCheckTrait(DefId) -> (),
 
     [] fn borrowck: BorrowCheck(DefId) -> Rc<BorrowCheckResult>,
-    // FIXME: shouldn't this return a `Result<(), BorrowckErrors>` instead?
-    [] fn mir_borrowck: MirBorrowCheck(DefId) -> (),
+
+    /// Borrow checks the function body. If this is a closure, returns
+    /// additional requirements that the closure's creator must verify.
+    [] fn mir_borrowck: MirBorrowCheck(DefId) -> Option<mir::ClosureRegionRequirements<'tcx>>,
 
     /// Gets a complete map from all types to their inherent impls.
     /// Not meant to be used directly outside of coherence.
@@ -204,6 +206,9 @@ define_maps! { <'tcx>
     /// other items (such as enum variant explicit discriminants).
     [] fn const_eval: const_eval_dep_node(ty::ParamEnvAnd<'tcx, (DefId, &'tcx Substs<'tcx>)>)
         -> const_val::EvalResult<'tcx>,
+
+    [] fn check_match: CheckMatch(DefId)
+        -> Result<(), ErrorReported>,
 
     /// Performs the privacy check and computes "access levels".
     [] fn privacy_access_levels: PrivacyAccessLevels(CrateNum) -> Rc<AccessLevels>,
@@ -298,6 +303,8 @@ define_maps! { <'tcx>
         -> Option<NativeLibraryKind>,
     [] fn link_args: link_args_node(CrateNum) -> Rc<Vec<String>>,
 
+    // Lifetime resolution. See `middle::resolve_lifetimes`.
+    [] fn resolve_lifetimes: ResolveLifetimes(CrateNum) -> Rc<ResolveLifetimes>,
     [] fn named_region_map: NamedRegion(DefIndex) ->
         Option<Rc<FxHashMap<ItemLocalId, Region>>>,
     [] fn is_late_bound_map: IsLateBound(DefIndex) ->
@@ -336,6 +343,7 @@ define_maps! { <'tcx>
         -> (Arc<DefIdSet>, Arc<Vec<Arc<CodegenUnit<'tcx>>>>),
     [] fn export_name: ExportName(DefId) -> Option<Symbol>,
     [] fn contains_extern_indicator: ContainsExternIndicator(DefId) -> bool,
+    [] fn symbol_export_level: GetSymbolExportLevel(DefId) -> SymbolExportLevel,
     [] fn is_translated_function: IsTranslatedFunction(DefId) -> bool,
     [] fn codegen_unit: CodegenUnit(InternedString) -> Arc<CodegenUnit<'tcx>>,
     [] fn compile_codegen_unit: CompileCodegenUnit(InternedString) -> Stats,
@@ -350,6 +358,17 @@ define_maps! { <'tcx>
     // however, which uses this query as a kind of cache.
     [] fn erase_regions_ty: erase_regions_ty(Ty<'tcx>) -> Ty<'tcx>,
     [] fn fully_normalize_monormophic_ty: normalize_ty_node(Ty<'tcx>) -> Ty<'tcx>,
+
+    [] fn substitute_normalize_and_test_predicates:
+        substitute_normalize_and_test_predicates_node((DefId, &'tcx Substs<'tcx>)) -> bool,
+
+    [] fn target_features_whitelist:
+        target_features_whitelist_node(CrateNum) -> Rc<FxHashSet<String>>,
+    [] fn target_features_enabled: TargetFeaturesEnabled(DefId) -> Rc<Vec<String>>,
+
+    // Get an estimate of the size of an InstanceDef based on its MIR for CGU partitioning.
+    [] fn instance_def_size_estimate: instance_def_size_estimate_dep_node(ty::InstanceDef<'tcx>)
+        -> usize,
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -373,10 +392,6 @@ fn fulfill_obligation_dep_node<'tcx>((param_env, trait_ref):
         param_env,
         trait_ref
     }
-}
-
-fn coherent_trait_dep_node<'tcx>((_, def_id): (CrateNum, DefId)) -> DepConstructor<'tcx> {
-    DepConstructor::CoherenceCheckTrait(def_id)
 }
 
 fn crate_inherent_impls_dep_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
@@ -493,4 +508,20 @@ fn vtable_methods_node<'tcx>(trait_ref: ty::PolyTraitRef<'tcx>) -> DepConstructo
 }
 fn normalize_ty_node<'tcx>(_: Ty<'tcx>) -> DepConstructor<'tcx> {
     DepConstructor::NormalizeTy
+}
+
+fn substitute_normalize_and_test_predicates_node<'tcx>(key: (DefId, &'tcx Substs<'tcx>))
+                                            -> DepConstructor<'tcx> {
+    DepConstructor::SubstituteNormalizeAndTestPredicates { key }
+}
+
+fn target_features_whitelist_node<'tcx>(_: CrateNum) -> DepConstructor<'tcx> {
+    DepConstructor::TargetFeaturesWhitelist
+}
+
+fn instance_def_size_estimate_dep_node<'tcx>(instance_def: ty::InstanceDef<'tcx>)
+                                              -> DepConstructor<'tcx> {
+    DepConstructor::InstanceDefSizeEstimate {
+        instance_def
+    }
 }

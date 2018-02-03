@@ -115,9 +115,8 @@ pub fn provide(providers: &mut Providers) {
 
         if let Some(id) = tcx.sess.derive_registrar_fn.get() {
             let def_id = tcx.hir.local_def_id(id);
-            let idx = def_id.index;
             let disambiguator = tcx.sess.local_crate_disambiguator();
-            let registrar = tcx.sess.generate_derive_registrar_symbol(disambiguator, idx);
+            let registrar = tcx.sess.generate_derive_registrar_symbol(disambiguator);
             local_crate.push((registrar, Some(def_id), SymbolExportLevel::C));
         }
 
@@ -134,6 +133,8 @@ pub fn provide(providers: &mut Providers) {
 
         Arc::new(local_crate)
     };
+
+    providers.symbol_export_level = export_level;
 }
 
 pub fn provide_extern(providers: &mut Providers) {
@@ -204,6 +205,7 @@ pub fn provide_extern(providers: &mut Providers) {
 
         Arc::new(crate_exports)
     };
+    providers.symbol_export_level = export_level;
 }
 
 fn export_level(tcx: TyCtxt, sym_def_id: DefId) -> SymbolExportLevel {

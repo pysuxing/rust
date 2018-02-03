@@ -162,6 +162,68 @@ fn test_iterator_step_by() {
 }
 
 #[test]
+fn test_iterator_step_by_nth() {
+    let mut it = (0..16).step_by(5);
+    assert_eq!(it.nth(0), Some(0));
+    assert_eq!(it.nth(0), Some(5));
+    assert_eq!(it.nth(0), Some(10));
+    assert_eq!(it.nth(0), Some(15));
+    assert_eq!(it.nth(0), None);
+
+    let it = (0..18).step_by(5);
+    assert_eq!(it.clone().nth(0), Some(0));
+    assert_eq!(it.clone().nth(1), Some(5));
+    assert_eq!(it.clone().nth(2), Some(10));
+    assert_eq!(it.clone().nth(3), Some(15));
+    assert_eq!(it.clone().nth(4), None);
+    assert_eq!(it.clone().nth(42), None);
+}
+
+#[test]
+fn test_iterator_step_by_nth_overflow() {
+    #[cfg(target_pointer_width = "8")]
+    type Bigger = u16;
+    #[cfg(target_pointer_width = "16")]
+    type Bigger = u32;
+    #[cfg(target_pointer_width = "32")]
+    type Bigger = u64;
+    #[cfg(target_pointer_width = "64")]
+    type Bigger = u128;
+
+    #[derive(Clone)]
+    struct Test(Bigger);
+    impl<'a> Iterator for &'a mut Test {
+        type Item = i32;
+        fn next(&mut self) -> Option<Self::Item> { Some(21) }
+        fn nth(&mut self, n: usize) -> Option<Self::Item> {
+            self.0 += n as Bigger + 1;
+            Some(42)
+        }
+    }
+
+    let mut it = Test(0);
+    let root = usize::MAX >> (::std::mem::size_of::<usize>() * 8 / 2);
+    let n = root + 20;
+    (&mut it).step_by(n).nth(n);
+    assert_eq!(it.0, n as Bigger * n as Bigger);
+
+    // large step
+    let mut it = Test(0);
+    (&mut it).step_by(usize::MAX).nth(5);
+    assert_eq!(it.0, (usize::MAX as Bigger) * 5);
+
+    // n + 1 overflows
+    let mut it = Test(0);
+    (&mut it).step_by(2).nth(usize::MAX);
+    assert_eq!(it.0, (usize::MAX as Bigger) * 2);
+
+    // n + 1 overflows
+    let mut it = Test(0);
+    (&mut it).step_by(1).nth(usize::MAX);
+    assert_eq!(it.0, (usize::MAX as Bigger) * 1);
+}
+
+#[test]
 #[should_panic]
 fn test_iterator_step_by_zero() {
     let mut it = (0..).step_by(0);
@@ -1350,6 +1412,51 @@ fn test_range_step() {
     assert_eq!((i8::MIN..i8::MAX).step_by(-(i8::MIN as i32) as usize).size_hint(), (2, Some(2)));
     assert_eq!((i16::MIN..i16::MAX).step_by(i16::MAX as usize).size_hint(), (3, Some(3)));
     assert_eq!((isize::MIN..isize::MAX).step_by(1).size_hint(), (usize::MAX, Some(usize::MAX)));
+}
+
+#[test]
+fn test_range_last_max() {
+    assert_eq!((0..20).last(), Some(19));
+    assert_eq!((-20..0).last(), Some(-1));
+    assert_eq!((5..5).last(), None);
+
+    assert_eq!((0..20).max(), Some(19));
+    assert_eq!((-20..0).max(), Some(-1));
+    assert_eq!((5..5).max(), None);
+}
+
+#[test]
+fn test_range_inclusive_last_max() {
+    assert_eq!((0..=20).last(), Some(20));
+    assert_eq!((-20..=0).last(), Some(0));
+    assert_eq!((5..=5).last(), Some(5));
+    let mut r = 10..=10;
+    r.next();
+    assert_eq!(r.last(), None);
+
+    assert_eq!((0..=20).max(), Some(20));
+    assert_eq!((-20..=0).max(), Some(0));
+    assert_eq!((5..=5).max(), Some(5));
+    let mut r = 10..=10;
+    r.next();
+    assert_eq!(r.max(), None);
+}
+
+#[test]
+fn test_range_min() {
+    assert_eq!((0..20).min(), Some(0));
+    assert_eq!((-20..0).min(), Some(-20));
+    assert_eq!((5..5).min(), None);
+}
+
+#[test]
+fn test_range_inclusive_min() {
+    assert_eq!((0..=20).min(), Some(0));
+    assert_eq!((-20..=0).min(), Some(-20));
+    assert_eq!((5..=5).min(), Some(5));
+    let mut r = 10..=10;
+    r.next();
+    assert_eq!(r.min(), None);
 }
 
 #[test]

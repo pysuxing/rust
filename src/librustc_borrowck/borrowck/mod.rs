@@ -170,7 +170,7 @@ fn build_borrowck_dataflow_data<'a, 'c, 'tcx, F>(this: &mut BorrowckCtxt<'a, 'tc
     if !force_analysis && move_data.is_empty() && all_loans.is_empty() {
         // large arrays of data inserted as constants can take a lot of
         // time and memory to borrow-check - see issue #36799. However,
-        // they don't have lvalues, so no borrow-check is actually needed.
+        // they don't have places, so no borrow-check is actually needed.
         // Recognize that case and skip borrow-checking.
         debug!("skipping loan propagation for {:?} because of no loans", body_id);
         return None;
@@ -269,6 +269,17 @@ impl<'b, 'tcx: 'b> BorrowckErrors for BorrowckCtxt<'b, 'tcx> {
     {
         self.tcx.sess.struct_span_err(sp, msg)
     }
+
+    fn cancel_if_wrong_origin<'a>(&'a self,
+                                mut diag: DiagnosticBuilder<'a>,
+                                o: Origin)
+                                -> DiagnosticBuilder<'a>
+    {
+        if !o.should_emit_errors(self.tcx.sess.borrowck_mode()) {
+            self.tcx.sess.diagnostic().cancel(&mut diag);
+        }
+        diag
+    }
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -335,6 +346,16 @@ impl<'tcx> LoanPath<'tcx> {
     }
 
     fn to_type(&self) -> Ty<'tcx> { self.ty }
+
+    fn has_downcast(&self) -> bool {
+        match self.kind {
+            LpDowncast(_, _) => true,
+            LpExtend(ref lp, _, LpInterior(_, _)) => {
+                lp.has_downcast()
+            }
+            _ => false,
+        }
+    }
 }
 
 // FIXME (pnkfelix): See discussion here
@@ -363,9 +384,9 @@ impl ToInteriorKind for mc::InteriorKind {
 }
 
 // This can be:
-// - a pointer dereference (`*LV` in README.md)
+// - a pointer dereference (`*P` in README.md)
 // - a field reference, with an optional definition of the containing
-//   enum variant (`LV.f` in README.md)
+//   enum variant (`P.f` in README.md)
 // `DefId` is present when the field is part of struct that is in
 // a variant of an enum. For instance in:
 // `enum E { X { foo: u32 }, Y { foo: u32 }}`
@@ -473,52 +494,58 @@ impl<'a, 'tcx> LoanPath<'tcx> {
     }
 }
 
-pub fn opt_loan_path<'tcx>(cmt: &mc::cmt<'tcx>) -> Option<Rc<LoanPath<'tcx>>> {
-    //! Computes the `LoanPath` (if any) for a `cmt`.
-    //! Note that this logic is somewhat duplicated in
-    //! the method `compute()` found in `gather_loans::restrictions`,
-    //! which allows it to share common loan path pieces as it
-    //! traverses the CMT.
-
+// Avoid "cannot borrow immutable field `self.x` as mutable" as that implies that a field *can* be
+// mutable independently of the struct it belongs to. (#35937)
+pub fn opt_loan_path_is_field<'tcx>(cmt: &mc::cmt<'tcx>) -> (Option<Rc<LoanPath<'tcx>>>, bool) {
     let new_lp = |v: LoanPathKind<'tcx>| Rc::new(LoanPath::new(v, cmt.ty));
 
     match cmt.cat {
         Categorization::Rvalue(..) |
         Categorization::StaticItem => {
-            None
+            (None, false)
         }
 
         Categorization::Local(id) => {
-            Some(new_lp(LpVar(id)))
+            (Some(new_lp(LpVar(id))), false)
         }
 
         Categorization::Upvar(mc::Upvar { id, .. }) => {
-            Some(new_lp(LpUpvar(id)))
+            (Some(new_lp(LpUpvar(id))), false)
         }
 
         Categorization::Deref(ref cmt_base, pk) => {
-            opt_loan_path(cmt_base).map(|lp| {
+            let lp = opt_loan_path_is_field(cmt_base);
+            (lp.0.map(|lp| {
                 new_lp(LpExtend(lp, cmt.mutbl, LpDeref(pk)))
-            })
+            }), lp.1)
         }
 
         Categorization::Interior(ref cmt_base, ik) => {
-            opt_loan_path(cmt_base).map(|lp| {
+            (opt_loan_path(cmt_base).map(|lp| {
                 let opt_variant_id = match cmt_base.cat {
                     Categorization::Downcast(_, did) =>  Some(did),
                     _ => None
                 };
                 new_lp(LpExtend(lp, cmt.mutbl, LpInterior(opt_variant_id, ik.cleaned())))
-            })
+            }), true)
         }
 
-        Categorization::Downcast(ref cmt_base, variant_def_id) =>
-            opt_loan_path(cmt_base)
-            .map(|lp| {
+        Categorization::Downcast(ref cmt_base, variant_def_id) => {
+            let lp = opt_loan_path_is_field(cmt_base);
+            (lp.0.map(|lp| {
                 new_lp(LpDowncast(lp, variant_def_id))
-            }),
-
+            }), lp.1)
+        }
     }
+}
+
+/// Computes the `LoanPath` (if any) for a `cmt`.
+/// Note that this logic is somewhat duplicated in
+/// the method `compute()` found in `gather_loans::restrictions`,
+/// which allows it to share common loan path pieces as it
+/// traverses the CMT.
+pub fn opt_loan_path<'tcx>(cmt: &mc::cmt<'tcx>) -> Option<Rc<LoanPath<'tcx>>> {
+    opt_loan_path_is_field(cmt).0
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -704,16 +731,20 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                          move_note));
             err
         } else {
-            err.span_label(use_span, format!("value {} here after move", verb_participle))
-               .span_label(move_span, format!("value moved{} here", move_note));
+            err.span_label(use_span, format!("value {} here after move", verb_participle));
+            err.span_label(move_span, format!("value moved{} here", move_note));
             err
         };
 
         if need_note {
-            err.note(&format!("move occurs because `{}` has type `{}`, \
-                               which does not implement the `Copy` trait",
-                              self.loan_path_to_string(moved_lp),
-                              moved_lp.ty));
+            err.note(&format!(
+                "move occurs because {} has type `{}`, which does not implement the `Copy` trait",
+                if moved_lp.has_downcast() {
+                    "the value".to_string()
+                } else {
+                    format!("`{}`", self.loan_path_to_string(moved_lp))
+                },
+                moved_lp.ty));
         }
 
         // Note: we used to suggest adding a `ref binding` or calling
@@ -741,11 +772,12 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                                                 &move_data::Assignment) {
         let mut err = self.cannot_reassign_immutable(span,
                                                      &self.loan_path_to_string(lp),
+                                                     false,
                                                      Origin::Ast);
         err.span_label(span, "cannot assign twice to immutable variable");
         if span != assign.span {
             err.span_label(assign.span, format!("first assignment to `{}`",
-                                              self.loan_path_to_string(lp)));
+                                                self.loan_path_to_string(lp)));
         }
         err.emit();
     }
@@ -776,14 +808,26 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                     mc::NoteClosureEnv(_) | mc::NoteUpvarRef(_) => {
                         self.cmt_to_string(&err.cmt)
                     }
-                    _ => match opt_loan_path(&err.cmt) {
-                        None => {
+                    _ => match opt_loan_path_is_field(&err.cmt) {
+                        (None, true) => {
+                            format!("{} of {} binding",
+                                    self.cmt_to_string(&err.cmt),
+                                    err.cmt.mutbl.to_user_str())
+
+                        }
+                        (None, false) => {
                             format!("{} {}",
                                     err.cmt.mutbl.to_user_str(),
                                     self.cmt_to_string(&err.cmt))
 
                         }
-                        Some(lp) => {
+                        (Some(lp), true) => {
+                            format!("{} `{}` of {} binding",
+                                    self.cmt_to_string(&err.cmt),
+                                    self.loan_path_to_string(&lp),
+                                    err.cmt.mutbl.to_user_str())
+                        }
+                        (Some(lp), false) => {
                             format!("{} {} `{}`",
                                     err.cmt.mutbl.to_user_str(),
                                     self.cmt_to_string(&err.cmt),
@@ -798,10 +842,32 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                         if let mc::NoteClosureEnv(upvar_id) = err.cmt.note {
                             let node_id = self.tcx.hir.hir_to_node_id(upvar_id.var_id);
                             let sp = self.tcx.hir.span(node_id);
-                            match self.tcx.sess.codemap().span_to_snippet(sp) {
-                                Ok(snippet) => {
+                            let fn_closure_msg = "`Fn` closures cannot capture their enclosing \
+                                                  environment for modifications";
+                            match (self.tcx.sess.codemap().span_to_snippet(sp), &err.cmt.cat) {
+                                (_, &Categorization::Upvar(mc::Upvar {
+                                    kind: ty::ClosureKind::Fn, ..
+                                })) => {
+                                    db.note(fn_closure_msg);
+                                    // we should point at the cause for this closure being
+                                    // identified as `Fn` (like in signature of method this
+                                    // closure was passed into)
+                                }
+                                (Ok(ref snippet), ref cat) => {
                                     let msg = &format!("consider making `{}` mutable", snippet);
-                                    db.span_suggestion(sp, msg, format!("mut {}", snippet));
+                                    let suggestion = format!("mut {}", snippet);
+
+                                    if let &Categorization::Deref(ref cmt, _) = cat {
+                                        if let Categorization::Upvar(mc::Upvar {
+                                            kind: ty::ClosureKind::Fn, ..
+                                        }) = cmt.cat {
+                                            db.note(fn_closure_msg);
+                                        } else {
+                                            db.span_suggestion(sp, msg, suggestion);
+                                        }
+                                    } else {
+                                        db.span_suggestion(sp, msg, suggestion);
+                                    }
                                 }
                                 _ => {
                                     db.span_help(sp, "consider making this binding mutable");
@@ -840,79 +906,10 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                     }
                 };
 
-                // When you have a borrow that lives across a yield,
-                // that reference winds up captured in the generator
-                // type. Regionck then constraints it to live as long
-                // as the generator itself. If that borrow is borrowing
-                // data owned by the generator, this winds up resulting in
-                // an `err_out_of_scope` error:
-                //
-                // ```
-                // {
-                //     let g = || {
-                //         let a = &3; // this borrow is forced to ... -+
-                //         yield ();          //                        |
-                //         println!("{}", a); //                        |
-                //     };                     //                        |
-                // } <----------------------... live until here --------+
-                // ```
-                //
-                // To detect this case, we look for cases where the
-                // `super_scope` (lifetime of the value) is within the
-                // body, but the `sub_scope` is not.
-                debug!("err_out_of_scope: self.body.is_generator = {:?}",
-                       self.body.is_generator);
-                let maybe_borrow_across_yield = if self.body.is_generator {
-                    let body_scope = region::Scope::Node(self.body.value.hir_id.local_id);
-                    debug!("err_out_of_scope: body_scope = {:?}", body_scope);
-                    debug!("err_out_of_scope: super_scope = {:?}", super_scope);
-                    debug!("err_out_of_scope: sub_scope = {:?}", sub_scope);
-                    match (super_scope, sub_scope) {
-                        (&ty::RegionKind::ReScope(value_scope),
-                         &ty::RegionKind::ReScope(loan_scope)) => {
-                            if {
-                                // value_scope <= body_scope &&
-                                self.region_scope_tree.is_subscope_of(value_scope, body_scope) &&
-                                    // body_scope <= loan_scope
-                                    self.region_scope_tree.is_subscope_of(body_scope, loan_scope)
-                            } {
-                                // We now know that this is a case
-                                // that fits the bill described above:
-                                // a borrow of something whose scope
-                                // is within the generator, but the
-                                // borrow is for a scope outside the
-                                // generator.
-                                //
-                                // Now look within the scope of the of
-                                // the value being borrowed (in the
-                                // example above, that would be the
-                                // block remainder that starts with
-                                // `let a`) for a yield. We can cite
-                                // that for the user.
-                                self.region_scope_tree.yield_in_scope(value_scope)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-
-                if let Some((yield_span, _)) = maybe_borrow_across_yield {
-                    debug!("err_out_of_scope: opt_yield_span = {:?}", yield_span);
-                    self.cannot_borrow_across_generator_yield(error_span, yield_span, Origin::Ast)
-                        .emit();
-                    return;
-                }
-
                 let mut db = self.path_does_not_live_long_enough(error_span, &msg, Origin::Ast);
-                let (value_kind, value_msg) = match err.cmt.cat {
-                    mc::Categorization::Rvalue(..) =>
-                        ("temporary value", "temporary value created here"),
-                    _ =>
-                        ("borrowed value", "borrow occurs here")
+                let value_kind = match err.cmt.cat {
+                    mc::Categorization::Rvalue(..) => "temporary value",
+                    _ => "borrowed value",
                 };
 
                 let is_closure = match cause {
@@ -925,14 +922,16 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                             Some(primary) => {
                                 db.span = MultiSpan::from_span(s);
                                 db.span_label(primary, "capture occurs here");
-                                db.span_label(s, "does not live long enough");
+                                db.span_label(s, format!("{} does not live long enough",
+                                                         value_kind));
                                 true
                             }
                             None => false
                         }
                     }
                     _ => {
-                        db.span_label(error_span, "does not live long enough");
+                        db.span_label(error_span, format!("{} does not live long enough",
+                                                          value_kind));
                         false
                     }
                 };
@@ -943,8 +942,6 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                 match (sub_span, super_span) {
                     (Some(s1), Some(s2)) if s1 == s2 => {
                         if !is_closure {
-                            db.span = MultiSpan::from_span(s1);
-                            db.span_label(error_span, value_msg);
                             let msg = match opt_loan_path(&err.cmt) {
                                 None => value_kind.to_string(),
                                 Some(lp) => {
@@ -960,8 +957,6 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                                 they are created");
                     }
                     (Some(s1), Some(s2)) if !is_closure => {
-                        db.span = MultiSpan::from_span(s2);
-                        db.span_label(error_span, value_msg);
                         let msg = match opt_loan_path(&err.cmt) {
                             None => value_kind.to_string(),
                             Some(lp) => {
@@ -1073,15 +1068,20 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
         };
 
         match cause {
-            mc::AliasableStatic |
+            mc::AliasableStatic => {
+                // This happens when we have an `&mut` or assignment to a
+                // static. We should have already reported a mutability
+                // violation first, but may have continued compiling.
+                self.tcx.sess.delay_span_bug(
+                    span,
+                    &format!("aliasability violation for static `{}`", prefix)
+                );
+                return;
+            }
             mc::AliasableStaticMut => {
-                // This path cannot occur. It happens when we have an
-                // `&mut` or assignment to a static. But in the case
-                // of `static X`, we get a mutability violation first,
-                // and never get here. In the case of `static mut X`,
-                // that is unsafe and hence the aliasability error is
-                // ignored.
-                span_bug!(span, "aliasability violation for static `{}`", prefix)
+                // This path cannot occur. `static mut X` is not checked
+                // for aliasability violations.
+                span_bug!(span, "aliasability violation for static mut `{}`", prefix)
             }
             mc::AliasableBorrowed => {}
         };
@@ -1276,7 +1276,8 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
     fn region_end_span(&self, region: ty::Region<'tcx>) -> Option<Span> {
         match *region {
             ty::ReScope(scope) => {
-                Some(scope.span(self.tcx, &self.region_scope_tree).end_point())
+                Some(self.tcx.sess.codemap().end_point(
+                        scope.span(self.tcx, &self.region_scope_tree)))
             }
             _ => None
         }
@@ -1319,7 +1320,7 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
                 } else if let Categorization::Interior(ref cmt, _) = err.cmt.cat {
                     if let mc::MutabilityCategory::McImmutable = cmt.mutbl {
                         db.span_label(*error_span,
-                                      "cannot mutably borrow immutable field");
+                                      "cannot mutably borrow field of immutable binding");
                     }
                 }
             }
@@ -1384,7 +1385,7 @@ impl<'a, 'tcx> BorrowckCtxt<'a, 'tcx> {
             LpDowncast(ref lp_base, variant_def_id) => {
                 out.push('(');
                 self.append_autoderefd_loan_path_to_string(&lp_base, out);
-                out.push(':');
+                out.push_str(DOWNCAST_PRINTED_OPERATOR);
                 out.push_str(&self.tcx.item_path_str(variant_def_id));
                 out.push(')');
             }

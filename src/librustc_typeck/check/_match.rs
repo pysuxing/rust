@@ -14,8 +14,8 @@ use rustc::hir::pat_util::EnumerateAndAdjustIterator;
 use rustc::infer;
 use rustc::infer::type_variable::TypeVariableOrigin;
 use rustc::traits::ObligationCauseCode;
-use rustc::ty::{self, Ty, TypeFoldable, LvaluePreference};
-use check::{FnCtxt, Expectation, Diverges};
+use rustc::ty::{self, Ty, TypeFoldable};
+use check::{FnCtxt, Expectation, Diverges, Needs};
 use check::coercion::CoerceMany;
 use util::nodemap::FxHashMap;
 
@@ -120,15 +120,33 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                         .pat_adjustments_mut()
                         .insert(pat.hir_id, pat_adjustments);
                 } else {
+                    let mut ref_sp = pat.span;
+                    let mut id = pat.id;
+                    loop {  // make span include all enclosing `&` to avoid confusing diag output
+                        id = tcx.hir.get_parent_node(id);
+                        let node = tcx.hir.find(id);
+                        if let Some(hir::map::NodePat(pat)) = node {
+                            if let hir::PatKind::Ref(..) = pat.node {
+                                ref_sp = pat.span;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    let sp = ref_sp.to(pat.span);
                     let mut err = feature_gate::feature_err(
                         &tcx.sess.parse_sess,
                         "match_default_bindings",
-                        pat.span,
+                        sp,
                         feature_gate::GateIssue::Language,
                         "non-reference pattern used to match a reference",
                     );
-                    if let Ok(snippet) = tcx.sess.codemap().span_to_snippet(pat.span) {
-                        err.span_suggestion(pat.span, "consider using", format!("&{}", &snippet));
+                    if let Ok(snippet) = tcx.sess.codemap().span_to_snippet(sp) {
+                        err.span_suggestion(sp,
+                                            "consider using a reference",
+                                            format!("&{}", &snippet));
                     }
                     err.emit();
                 }
@@ -482,7 +500,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
 
     pub fn check_dereferencable(&self, span: Span, expected: Ty<'tcx>, inner: &hir::Pat) -> bool {
         if let PatKind::Binding(..) = inner.node {
-            if let Some(mt) = self.shallow_resolve(expected).builtin_deref(true, ty::NoPreference) {
+            if let Some(mt) = self.shallow_resolve(expected).builtin_deref(true) {
                 if let ty::TyDynamic(..) = mt.ty.sty {
                     // This is "x = SomeTrait" being reduced from
                     // "let &x = &SomeTrait" or "let box x = Box<SomeTrait>", an error.
@@ -566,7 +584,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                         });
         let discrim_ty;
         if let Some(m) = contains_ref_bindings {
-            discrim_ty = self.check_expr_with_lvalue_pref(discrim, LvaluePreference::from_mutbl(m));
+            discrim_ty = self.check_expr_with_needs(discrim, Needs::maybe_mut_place(m));
         } else {
             // ...but otherwise we want to use any supertype of the
             // discriminant. This is sort of a workaround, see note (*) in
@@ -782,7 +800,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         let pat_ty = self.instantiate_value_path(segments, opt_ty, def, pat.span, pat.id);
         // Replace constructor type with constructed type for tuple struct patterns.
         let pat_ty = pat_ty.fn_sig(tcx).output();
-        let pat_ty = tcx.no_late_bound_regions(&pat_ty).expect("expected fn type");
+        let pat_ty = pat_ty.no_late_bound_regions().expect("expected fn type");
 
         self.demand_eqtype(pat.span, expected, pat_ty);
 

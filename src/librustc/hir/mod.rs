@@ -28,19 +28,20 @@ pub use self::UnsafeSource::*;
 pub use self::Visibility::{Public, Inherited};
 
 use hir::def::Def;
-use hir::def_id::{DefId, DefIndex, CRATE_DEF_INDEX};
+use hir::def_id::{DefId, DefIndex, LocalDefId, CRATE_DEF_INDEX};
 use util::nodemap::{NodeMap, FxHashSet};
 
 use syntax_pos::{Span, DUMMY_SP};
 use syntax::codemap::{self, Spanned};
 use syntax::abi::Abi;
-use syntax::ast::{Ident, Name, NodeId, DUMMY_NODE_ID, AsmDialect};
+use syntax::ast::{self, Name, NodeId, DUMMY_NODE_ID, AsmDialect};
 use syntax::ast::{Attribute, Lit, StrStyle, FloatTy, IntTy, UintTy, MetaItem};
 use syntax::ext::hygiene::SyntaxContext;
 use syntax::ptr::P;
 use syntax::symbol::{Symbol, keywords};
 use syntax::tokenstream::TokenStream;
 use syntax::util::ThinVec;
+use syntax::util::parser::ExprPrecedence;
 use ty::AdtKind;
 
 use rustc_data_structures::indexed_vec;
@@ -48,6 +49,8 @@ use rustc_data_structures::indexed_vec;
 use serialize::{self, Encoder, Encodable, Decoder, Decodable};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::iter;
+use std::slice;
 
 /// HIR doesn't commit to a concrete storage type and has its own alias for a vector.
 /// It can be `Vec`, `P<[T]>` or potentially `Box<[T]>`, or some other container with similar
@@ -90,6 +93,16 @@ pub mod svh;
 pub struct HirId {
     pub owner: DefIndex,
     pub local_id: ItemLocalId,
+}
+
+impl HirId {
+    pub fn owner_def_id(self) -> DefId {
+        DefId::local(self.owner)
+    }
+
+    pub fn owner_local_def_id(self) -> LocalDefId {
+        LocalDefId::from_def_id(DefId::local(self.owner))
+    }
 }
 
 impl serialize::UseSpecializedEncodable for HirId {
@@ -158,6 +171,18 @@ pub const DUMMY_HIR_ID: HirId = HirId {
 };
 
 pub const DUMMY_ITEM_LOCAL_ID: ItemLocalId = ItemLocalId(!0);
+
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
+pub struct Label {
+    pub name: Name,
+    pub span: Span,
+}
+
+impl fmt::Debug for Label {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "label({:?})", self.name)
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Copy)]
 pub struct Lifetime {
@@ -229,7 +254,7 @@ pub struct LifetimeDef {
 }
 
 /// A "Path" is essentially Rust's notion of a name; for instance:
-/// std::cmp::PartialEq  .  It's represented as a sequence of identifiers,
+/// `std::cmp::PartialEq`. It's represented as a sequence of identifiers,
 /// along with a bunch of supporting information.
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash)]
 pub struct Path {
@@ -248,8 +273,13 @@ impl Path {
 
 impl fmt::Debug for Path {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "path({})",
-               print::to_string(print::NO_ANN, |s| s.print_path(self, false)))
+        write!(f, "path({})", print::to_string(print::NO_ANN, |s| s.print_path(self, false)))
+    }
+}
+
+impl fmt::Display for Path {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", print::to_string(print::NO_ANN, |s| s.print_path(self, false)))
     }
 }
 
@@ -383,12 +413,67 @@ pub struct TyParam {
     pub synthetic: Option<SyntheticTyParamKind>,
 }
 
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
+pub enum GenericParam {
+    Lifetime(LifetimeDef),
+    Type(TyParam),
+}
+
+impl GenericParam {
+    pub fn is_lifetime_param(&self) -> bool {
+        match *self {
+            GenericParam::Lifetime(_) => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_type_param(&self) -> bool {
+        match *self {
+            GenericParam::Type(_) => true,
+            _ => false,
+        }
+    }
+}
+
+pub trait GenericParamsExt {
+    fn lifetimes<'a>(&'a self) -> iter::FilterMap<
+        slice::Iter<GenericParam>,
+        fn(&GenericParam) -> Option<&LifetimeDef>,
+    >;
+
+    fn ty_params<'a>(&'a self) -> iter::FilterMap<
+        slice::Iter<GenericParam>,
+        fn(&GenericParam) -> Option<&TyParam>,
+    >;
+}
+
+impl GenericParamsExt for [GenericParam] {
+    fn lifetimes<'a>(&'a self) -> iter::FilterMap<
+        slice::Iter<GenericParam>,
+        fn(&GenericParam) -> Option<&LifetimeDef>,
+    > {
+        self.iter().filter_map(|param| match *param {
+            GenericParam::Lifetime(ref l) => Some(l),
+            _ => None,
+        })
+    }
+
+    fn ty_params<'a>(&'a self) -> iter::FilterMap<
+        slice::Iter<GenericParam>,
+        fn(&GenericParam) -> Option<&TyParam>,
+    > {
+        self.iter().filter_map(|param| match *param {
+            GenericParam::Type(ref t) => Some(t),
+            _ => None,
+        })
+    }
+}
+
 /// Represents lifetimes and type parameters attached to a declaration
 /// of a function, enum, trait, etc.
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct Generics {
-    pub lifetimes: HirVec<LifetimeDef>,
-    pub ty_params: HirVec<TyParam>,
+    pub params: HirVec<GenericParam>,
     pub where_clause: WhereClause,
     pub span: Span,
 }
@@ -396,8 +481,7 @@ pub struct Generics {
 impl Generics {
     pub fn empty() -> Generics {
         Generics {
-            lifetimes: HirVec::new(),
-            ty_params: HirVec::new(),
+            params: HirVec::new(),
             where_clause: WhereClause {
                 id: DUMMY_NODE_ID,
                 predicates: HirVec::new(),
@@ -407,15 +491,19 @@ impl Generics {
     }
 
     pub fn is_lt_parameterized(&self) -> bool {
-        !self.lifetimes.is_empty()
+        self.params.iter().any(|param| param.is_lifetime_param())
     }
 
     pub fn is_type_parameterized(&self) -> bool {
-        !self.ty_params.is_empty()
+        self.params.iter().any(|param| param.is_type_param())
     }
 
-    pub fn is_parameterized(&self) -> bool {
-        self.is_lt_parameterized() || self.is_type_parameterized()
+    pub fn lifetimes<'a>(&'a self) -> impl Iterator<Item = &'a LifetimeDef> {
+        self.params.lifetimes()
+    }
+
+    pub fn ty_params<'a>(&'a self) -> impl Iterator<Item = &'a TyParam> {
+        self.params.ty_params()
     }
 }
 
@@ -435,17 +523,22 @@ impl UnsafeGeneric {
 
 impl Generics {
     pub fn carries_unsafe_attr(&self) -> Option<UnsafeGeneric> {
-        for r in &self.lifetimes {
-            if r.pure_wrt_drop {
-                return Some(UnsafeGeneric::Region(r.clone(), "may_dangle"));
+        for param in &self.params {
+            match *param {
+                GenericParam::Lifetime(ref l) => {
+                    if l.pure_wrt_drop {
+                        return Some(UnsafeGeneric::Region(l.clone(), "may_dangle"));
+                    }
+                }
+                GenericParam::Type(ref t) => {
+                    if t.pure_wrt_drop {
+                        return Some(UnsafeGeneric::Type(t.clone(), "may_dangle"));
+                    }
+                }
             }
         }
-        for t in &self.ty_params {
-            if t.pure_wrt_drop {
-                return Some(UnsafeGeneric::Type(t.clone(), "may_dangle"));
-            }
-        }
-        return None;
+
+        None
     }
 }
 
@@ -478,8 +571,8 @@ pub enum WherePredicate {
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct WhereBoundPredicate {
     pub span: Span,
-    /// Any lifetimes from a `for` binding
-    pub bound_lifetimes: HirVec<LifetimeDef>,
+    /// Any generics from a `for` binding
+    pub bound_generic_params: HirVec<GenericParam>,
     /// The type being bounded
     pub bounded_ty: P<Ty>,
     /// Trait and lifetime bounds (`Clone+Send+'static`)
@@ -508,7 +601,9 @@ pub type CrateConfig = HirVec<P<MetaItem>>;
 /// The top-level data structure that stores the entire contents of
 /// the crate currently being compiled.
 ///
-/// For more details, see [the module-level README](README.md).
+/// For more details, see the module-level [README].
+///
+/// [README]: https://github.com/rust-lang/rust/blob/master/src/librustc/hir/README.md.
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Debug)]
 pub struct Crate {
     pub module: Mod,
@@ -610,6 +705,11 @@ pub struct Block {
     /// currently permitted in Rust itself, but it is generated as
     /// part of `catch` statements.
     pub targeted_by_break: bool,
+    /// If true, don't emit return value type errors as the parser had
+    /// to recover from a parse error so this block will not have an
+    /// appropriate type. A parse error will have been emitted so the
+    /// compilation will never succeed if this is true.
+    pub recovered: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash)]
@@ -871,6 +971,31 @@ impl BinOp_ {
     }
 }
 
+impl Into<ast::BinOpKind> for BinOp_ {
+    fn into(self) -> ast::BinOpKind {
+        match self {
+            BiAdd => ast::BinOpKind::Add,
+            BiSub => ast::BinOpKind::Sub,
+            BiMul => ast::BinOpKind::Mul,
+            BiDiv => ast::BinOpKind::Div,
+            BiRem => ast::BinOpKind::Rem,
+            BiAnd => ast::BinOpKind::And,
+            BiOr => ast::BinOpKind::Or,
+            BiBitXor => ast::BinOpKind::BitXor,
+            BiBitAnd => ast::BinOpKind::BitAnd,
+            BiBitOr => ast::BinOpKind::BitOr,
+            BiShl => ast::BinOpKind::Shl,
+            BiShr => ast::BinOpKind::Shr,
+            BiEq => ast::BinOpKind::Eq,
+            BiLt => ast::BinOpKind::Lt,
+            BiLe => ast::BinOpKind::Le,
+            BiNe => ast::BinOpKind::Ne,
+            BiGe => ast::BinOpKind::Ge,
+            BiGt => ast::BinOpKind::Gt,
+        }
+    }
+}
+
 pub type BinOp = Spanned<BinOp_>;
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
@@ -1079,6 +1204,42 @@ pub struct Expr {
     pub hir_id: HirId,
 }
 
+impl Expr {
+    pub fn precedence(&self) -> ExprPrecedence {
+        match self.node {
+            ExprBox(_) => ExprPrecedence::Box,
+            ExprArray(_) => ExprPrecedence::Array,
+            ExprCall(..) => ExprPrecedence::Call,
+            ExprMethodCall(..) => ExprPrecedence::MethodCall,
+            ExprTup(_) => ExprPrecedence::Tup,
+            ExprBinary(op, ..) => ExprPrecedence::Binary(op.node.into()),
+            ExprUnary(..) => ExprPrecedence::Unary,
+            ExprLit(_) => ExprPrecedence::Lit,
+            ExprType(..) | ExprCast(..) => ExprPrecedence::Cast,
+            ExprIf(..) => ExprPrecedence::If,
+            ExprWhile(..) => ExprPrecedence::While,
+            ExprLoop(..) => ExprPrecedence::Loop,
+            ExprMatch(..) => ExprPrecedence::Match,
+            ExprClosure(..) => ExprPrecedence::Closure,
+            ExprBlock(..) => ExprPrecedence::Block,
+            ExprAssign(..) => ExprPrecedence::Assign,
+            ExprAssignOp(..) => ExprPrecedence::AssignOp,
+            ExprField(..) => ExprPrecedence::Field,
+            ExprTupField(..) => ExprPrecedence::TupField,
+            ExprIndex(..) => ExprPrecedence::Index,
+            ExprPath(..) => ExprPrecedence::Path,
+            ExprAddrOf(..) => ExprPrecedence::AddrOf,
+            ExprBreak(..) => ExprPrecedence::Break,
+            ExprAgain(..) => ExprPrecedence::Continue,
+            ExprRet(..) => ExprPrecedence::Ret,
+            ExprInlineAsm(..) => ExprPrecedence::InlineAsm,
+            ExprStruct(..) => ExprPrecedence::Struct,
+            ExprRepeat(..) => ExprPrecedence::Repeat,
+            ExprYield(..) => ExprPrecedence::Yield,
+        }
+    }
+}
+
 impl fmt::Debug for Expr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "expr({}: {})", self.id,
@@ -1127,11 +1288,11 @@ pub enum Expr_ {
     /// A while loop, with an optional label
     ///
     /// `'label: while expr { block }`
-    ExprWhile(P<Expr>, P<Block>, Option<Spanned<Name>>),
+    ExprWhile(P<Expr>, P<Block>, Option<Label>),
     /// Conditionless loop (can be exited with break, continue, or return)
     ///
     /// `'label: loop { block }`
-    ExprLoop(P<Block>, Option<Spanned<Name>>, LoopSource),
+    ExprLoop(P<Block>, Option<Label>, LoopSource),
     /// A `match` block, with a source that indicates whether or not it is
     /// the result of a desugaring, and if so, which kind.
     ExprMatch(P<Expr>, HirVec<Arm>, MatchSource),
@@ -1141,7 +1302,7 @@ pub enum Expr_ {
     ///
     /// This may also be a generator literal, indicated by the final boolean,
     /// in that case there is an GeneratorClause.
-    ExprClosure(CaptureClause, P<FnDecl>, BodyId, Span, bool),
+    ExprClosure(CaptureClause, P<FnDecl>, BodyId, Span, Option<GeneratorMovability>),
     /// A block (`{ ... }`)
     ExprBlock(P<Block>),
 
@@ -1310,11 +1471,17 @@ impl ScopeTarget {
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
 pub struct Destination {
     // This is `Some(_)` iff there is an explicit user-specified `label
-    pub ident: Option<Spanned<Ident>>,
+    pub label: Option<Label>,
 
     // These errors are caught and then reported during the diagnostics pass in
     // librustc_passes/loops.rs
     pub target_id: ScopeTarget,
+}
+
+#[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
+pub enum GeneratorMovability {
+    Static,
+    Movable,
 }
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug, Copy)]
@@ -1460,7 +1627,7 @@ pub enum PrimTy {
 pub struct BareFnTy {
     pub unsafety: Unsafety,
     pub abi: Abi,
-    pub lifetimes: HirVec<LifetimeDef>,
+    pub generic_params: HirVec<GenericParam>,
     pub decl: P<FnDecl>,
     pub arg_names: HirVec<Spanned<Name>>,
 }
@@ -1496,7 +1663,7 @@ pub enum Ty_ {
     /// A trait object type `Bound1 + Bound2 + Bound3`
     /// where `Bound` is a trait or a lifetime.
     TyTraitObject(HirVec<PolyTraitRef>, Lifetime),
-    /// An exsitentially quantified (there exists a type satisfying) `impl
+    /// An existentially quantified (there exists a type satisfying) `impl
     /// Bound1 + Bound2 + Bound3` type where `Bound` is a trait or a lifetime.
     ///
     /// The `ExistTy` structure emulates an
@@ -1508,9 +1675,6 @@ pub enum Ty_ {
     /// because all in-scope type parameters are captured by `impl Trait`,
     /// so they are resolved directly through the parent `Generics`.
     TyImplTraitExistential(ExistTy, HirVec<Lifetime>),
-    /// An universally quantified (for all types satisfying) `impl
-    /// Bound1 + Bound2 + Bound3` type where `Bound` is a trait or a lifetime.
-    TyImplTraitUniversal(DefId, TyParamBounds),
     /// Unused for now
     TyTypeof(BodyId),
     /// TyInfer means the type should be inferred instead of it having been
@@ -1721,7 +1885,7 @@ pub struct TraitRef {
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Hash, Debug)]
 pub struct PolyTraitRef {
     /// The `'a` in `<'a> Foo<&'a T>`
-    pub bound_lifetimes: HirVec<LifetimeDef>,
+    pub bound_generic_params: HirVec<GenericParam>,
 
     /// The `Foo<&'a T>` in `<'a> Foo<&'a T>`
     pub trait_ref: TraitRef,
@@ -1878,11 +2042,9 @@ pub enum Item_ {
     ItemUnion(VariantData, Generics),
     /// Represents a Trait Declaration
     ItemTrait(IsAuto, Unsafety, Generics, TyParamBounds, HirVec<TraitItemRef>),
+    /// Represents a Trait Alias Declaration
+    ItemTraitAlias(Generics, TyParamBounds),
 
-    /// Auto trait implementations
-    ///
-    /// `impl Trait for .. {}`
-    ItemAutoImpl(Unsafety, TraitRef),
     /// An implementation, eg `impl<A> Trait for Foo { .. }`
     ItemImpl(Unsafety,
              ImplPolarity,
@@ -1909,8 +2071,8 @@ impl Item_ {
             ItemStruct(..) => "struct",
             ItemUnion(..) => "union",
             ItemTrait(..) => "trait",
-            ItemImpl(..) |
-            ItemAutoImpl(..) => "item",
+            ItemTraitAlias(..) => "trait alias",
+            ItemImpl(..) => "item",
         }
     }
 

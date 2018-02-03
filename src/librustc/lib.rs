@@ -44,8 +44,12 @@
 #![feature(box_syntax)]
 #![feature(conservative_impl_trait)]
 #![feature(const_fn)]
+#![feature(copy_closures, clone_closures)]
 #![feature(core_intrinsics)]
 #![feature(drain_filter)]
+#![feature(dyn_trait)]
+#![feature(from_ref)]
+#![feature(fs_read_write)]
 #![feature(i128)]
 #![feature(i128_type)]
 #![feature(inclusive_range)]
@@ -62,9 +66,10 @@
 #![feature(specialization)]
 #![feature(unboxed_closures)]
 #![feature(underscore_lifetimes)]
+#![feature(universal_impl_trait)]
 #![feature(trace_macros)]
+#![feature(catch_expr)]
 #![feature(test)]
-#![feature(const_atomic_bool_new)]
 
 #![recursion_limit="512"]
 
@@ -76,7 +81,6 @@ extern crate getopts;
 extern crate graphviz;
 #[cfg(windows)]
 extern crate libc;
-extern crate owning_ref;
 extern crate rustc_back;
 #[macro_use] extern crate rustc_data_structures;
 extern crate serialize;
@@ -88,6 +92,10 @@ extern crate syntax_pos;
 extern crate jobserver;
 
 extern crate serialize as rustc_serialize; // used by deriving
+
+extern crate rustc_apfloat;
+extern crate byteorder;
+extern crate backtrace;
 
 // Note that librustc doesn't actually depend on these crates, see the note in
 // `Cargo.toml` for this crate about why these are here.
@@ -132,7 +140,6 @@ pub mod middle {
     pub mod recursion_limit;
     pub mod resolve_lifetime;
     pub mod stability;
-    pub mod trans;
     pub mod weak_lang_items;
 }
 
@@ -171,4 +178,5 @@ fn noop() {
 
 
 // Build the diagnostics array at the end so that the metadata includes error use sites.
+#[cfg(not(stage0))] // remove after the next snapshot
 __build_diagnostic_array! { librustc, DIAGNOSTICS }

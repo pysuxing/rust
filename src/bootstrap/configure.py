@@ -65,6 +65,7 @@ o("sanitizers", "build.sanitizers", "build the sanitizer runtimes (asan, lsan, m
 o("dist-src", "rust.dist-src", "when building tarballs enables building a source tarball")
 o("cargo-openssl-static", "build.openssl-static", "static openssl in cargo")
 o("profiler", "build.profiler", "build the profiler runtime")
+o("emscripten", None, "compile the emscripten backend as well as LLVM")
 
 # Optimization and debugging options. These may be overridden by the release
 # channel, etc.
@@ -77,6 +78,7 @@ o("debuginfo", "rust.debuginfo", "build with debugger metadata")
 o("debuginfo-lines", "rust.debuginfo-lines", "build with line number debugger metadata")
 o("debuginfo-only-std", "rust.debuginfo-only-std", "build only libstd with debugging information")
 o("debug-jemalloc", "rust.debug-jemalloc", "build jemalloc with --enable-debug --enable-fill")
+v("save-toolstates", "rust.save-toolstates", "save build and test status of external tools into this file")
 
 v("prefix", "install.prefix", "set installation prefix")
 v("localstatedir", "install.localstatedir", "local state directory")
@@ -107,6 +109,8 @@ v("musl-root", "target.x86_64-unknown-linux-musl.musl-root",
   "MUSL root installation directory (deprecated)")
 v("musl-root-x86_64", "target.x86_64-unknown-linux-musl.musl-root",
   "x86_64-unknown-linux-musl install directory")
+v("musl-root-i586", "target.i586-unknown-linux-musl.musl-root",
+  "i586-unknown-linux-musl install directory")
 v("musl-root-i686", "target.i686-unknown-linux-musl.musl-root",
   "i686-unknown-linux-musl install directory")
 v("musl-root-arm", "target.arm-unknown-linux-musleabi.musl-root",
@@ -117,6 +121,10 @@ v("musl-root-armv7", "target.armv7-unknown-linux-musleabihf.musl-root",
   "armv7-unknown-linux-musleabihf install directory")
 v("musl-root-aarch64", "target.aarch64-unknown-linux-musl.musl-root",
   "aarch64-unknown-linux-musl install directory")
+v("musl-root-mips", "target.mips-unknown-linux-musl.musl-root",
+  "mips-unknown-linux-musl install directory")
+v("musl-root-mipsel", "target.mipsel-unknown-linux-musl.musl-root",
+  "mipsel-unknown-linux-musl install directory")
 v("qemu-armhf-rootfs", "target.arm-unknown-linux-gnueabihf.qemu-rootfs",
   "rootfs in qemu testing, you probably don't want to use this")
 v("qemu-aarch64-rootfs", "target.aarch64-unknown-linux-gnu.qemu-rootfs",
@@ -314,6 +322,8 @@ for key in known_args:
         set('build.host', value.split(','))
     elif option.name == 'target':
         set('build.target', value.split(','))
+    elif option.name == 'emscripten':
+        set('rust.codegen-backends', ['llvm', 'emscripten'])
     elif option.name == 'option-checking':
         # this was handled above
         pass

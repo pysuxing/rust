@@ -307,6 +307,7 @@ use fmt;
 use iter_private::TrustedRandomAccess;
 use ops::Try;
 use usize;
+use intrinsics;
 
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use self::iterator::Iterator;
@@ -692,6 +693,49 @@ impl<I> Iterator for StepBy<I> where I: Iterator {
         } else {
             let f = |n| n / (self.step+1);
             (f(inner_hint.0), inner_hint.1.map(f))
+        }
+    }
+
+    #[inline]
+    fn nth(&mut self, mut n: usize) -> Option<Self::Item> {
+        if self.first_take {
+            self.first_take = false;
+            let first = self.iter.next();
+            if n == 0 {
+                return first;
+            }
+            n -= 1;
+        }
+        // n and self.step are indices, we need to add 1 to get the amount of elements
+        // When calling `.nth`, we need to subtract 1 again to convert back to an index
+        // step + 1 can't overflow because `.step_by` sets `self.step` to `step - 1`
+        let mut step = self.step + 1;
+        // n + 1 could overflow
+        // thus, if n is usize::MAX, instead of adding one, we call .nth(step)
+        if n == usize::MAX {
+            self.iter.nth(step - 1);
+        } else {
+            n += 1;
+        }
+
+        // overflow handling
+        loop {
+            let mul = n.checked_mul(step);
+            if unsafe { intrinsics::likely(mul.is_some()) } {
+                return self.iter.nth(mul.unwrap() - 1);
+            }
+            let div_n = usize::MAX / n;
+            let div_step = usize::MAX / step;
+            let nth_n = div_n * n;
+            let nth_step = div_step * step;
+            let nth = if nth_n > nth_step {
+                step -= div_n;
+                nth_n
+            } else {
+                n -= div_step;
+                nth_step
+            };
+            self.iter.nth(nth - 1);
         }
     }
 }
@@ -1776,12 +1820,18 @@ impl<I: Iterator> Iterator for Peekable<I> {
 
     #[inline]
     fn nth(&mut self, n: usize) -> Option<I::Item> {
-        match self.peeked.take() {
-            // the .take() below is just to avoid "move into pattern guard"
-            Some(ref mut v) if n == 0 => v.take(),
-            Some(None) => None,
-            Some(Some(_)) => self.iter.nth(n - 1),
-            None => self.iter.nth(n),
+        // FIXME(#6393): merge these when borrow-checking gets better.
+        if n == 0 {
+            match self.peeked.take() {
+                Some(v) => v,
+                None => self.iter.nth(n),
+            }
+        } else {
+            match self.peeked.take() {
+                Some(None) => None,
+                Some(Some(_)) => self.iter.nth(n - 1),
+                None => self.iter.nth(n),
+            }
         }
     }
 

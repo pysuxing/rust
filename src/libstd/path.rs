@@ -86,6 +86,8 @@ use hash::{Hash, Hasher};
 use io;
 use iter::{self, FusedIterator};
 use ops::{self, Deref};
+use rc::Rc;
+use sync::Arc;
 
 use ffi::{OsStr, OsString};
 
@@ -571,6 +573,13 @@ impl<'a> Component<'a> {
 impl<'a> AsRef<OsStr> for Component<'a> {
     fn as_ref(&self) -> &OsStr {
         self.as_os_str()
+    }
+}
+
+#[stable(feature = "path_component_asref", since = "1.24.0")]
+impl<'a> AsRef<Path> for Component<'a> {
+    fn as_ref(&self) -> &Path {
+        self.as_os_str().as_ref()
     }
 }
 
@@ -1452,6 +1461,42 @@ impl<'a> From<PathBuf> for Cow<'a, Path> {
     }
 }
 
+#[stable(feature = "shared_from_slice2", since = "1.24.0")]
+impl From<PathBuf> for Arc<Path> {
+    #[inline]
+    fn from(s: PathBuf) -> Arc<Path> {
+        let arc: Arc<OsStr> = Arc::from(s.into_os_string());
+        unsafe { Arc::from_raw(Arc::into_raw(arc) as *const Path) }
+    }
+}
+
+#[stable(feature = "shared_from_slice2", since = "1.24.0")]
+impl<'a> From<&'a Path> for Arc<Path> {
+    #[inline]
+    fn from(s: &Path) -> Arc<Path> {
+        let arc: Arc<OsStr> = Arc::from(s.as_os_str());
+        unsafe { Arc::from_raw(Arc::into_raw(arc) as *const Path) }
+    }
+}
+
+#[stable(feature = "shared_from_slice2", since = "1.24.0")]
+impl From<PathBuf> for Rc<Path> {
+    #[inline]
+    fn from(s: PathBuf) -> Rc<Path> {
+        let rc: Rc<OsStr> = Rc::from(s.into_os_string());
+        unsafe { Rc::from_raw(Rc::into_raw(rc) as *const Path) }
+    }
+}
+
+#[stable(feature = "shared_from_slice2", since = "1.24.0")]
+impl<'a> From<&'a Path> for Rc<Path> {
+    #[inline]
+    fn from(s: &Path) -> Rc<Path> {
+        let rc: Rc<OsStr> = Rc::from(s.as_os_str());
+        unsafe { Rc::from_raw(Rc::into_raw(rc) as *const Path) }
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl ToOwned for Path {
     type Owned = PathBuf;
@@ -1664,6 +1709,7 @@ impl Path {
     /// let path_buf = Path::new("foo.txt").to_path_buf();
     /// assert_eq!(path_buf, std::path::PathBuf::from("foo.txt"));
     /// ```
+    #[rustc_conversion_suggestion]
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn to_path_buf(&self) -> PathBuf {
         PathBuf::from(self.inner.to_os_string())
@@ -1823,7 +1869,11 @@ impl Path {
     ///
     /// let path = Path::new("/test/haha/foo.txt");
     ///
+    /// assert_eq!(path.strip_prefix("/"), Ok(Path::new("test/haha/foo.txt")));
     /// assert_eq!(path.strip_prefix("/test"), Ok(Path::new("haha/foo.txt")));
+    /// assert_eq!(path.strip_prefix("/test/"), Ok(Path::new("haha/foo.txt")));
+    /// assert_eq!(path.strip_prefix("/test/haha/foo.txt"), Ok(Path::new("")));
+    /// assert_eq!(path.strip_prefix("/test/haha/foo.txt/"), Ok(Path::new("")));
     /// assert_eq!(path.strip_prefix("test").is_ok(), false);
     /// assert_eq!(path.strip_prefix("/haha").is_ok(), false);
     /// ```
@@ -1854,6 +1904,9 @@ impl Path {
     /// let path = Path::new("/etc/passwd");
     ///
     /// assert!(path.starts_with("/etc"));
+    /// assert!(path.starts_with("/etc/"));
+    /// assert!(path.starts_with("/etc/passwd"));
+    /// assert!(path.starts_with("/etc/passwd/"));
     ///
     /// assert!(!path.starts_with("/e"));
     /// ```
@@ -2567,6 +2620,9 @@ impl Error for StripPrefixError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use rc::Rc;
+    use sync::Arc;
 
     macro_rules! t(
         ($path:expr, iter: $iter:expr) => (
@@ -3969,5 +4025,22 @@ mod tests {
     fn display_format_flags() {
         assert_eq!(format!("a{:#<5}b", Path::new("").display()), "a#####b");
         assert_eq!(format!("a{:#<5}b", Path::new("a").display()), "aa####b");
+    }
+
+    #[test]
+    fn into_rc() {
+        let orig = "hello/world";
+        let path = Path::new(orig);
+        let rc: Rc<Path> = Rc::from(path);
+        let arc: Arc<Path> = Arc::from(path);
+
+        assert_eq!(&*rc, path);
+        assert_eq!(&*arc, path);
+
+        let rc2: Rc<Path> = Rc::from(path.to_owned());
+        let arc2: Arc<Path> = Arc::from(path.to_owned());
+
+        assert_eq!(&*rc2, path);
+        assert_eq!(&*arc2, path);
     }
 }

@@ -28,20 +28,16 @@
 
 #![feature(box_syntax)]
 #![feature(const_fn)]
-#![feature(libc)]
+#![feature(fs_read_write)]
 
 extern crate syntax;
-extern crate libc;
 extern crate rand;
 extern crate serialize;
 #[macro_use] extern crate log;
 
 extern crate serialize as rustc_serialize; // used by deriving
 
-pub mod tempdir;
 pub mod target;
-pub mod slice;
-pub mod dynamic_lib;
 
 use std::str::FromStr;
 

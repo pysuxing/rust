@@ -36,9 +36,14 @@ use syntax::ast::{self, Attribute, NodeId, PatKind, CRATE_NODE_ID};
 use syntax::parse::token;
 use syntax::symbol::keywords;
 use syntax::visit::{self, Visitor};
-use syntax::print::pprust::{bounds_to_string, generics_to_string, path_to_string, ty_to_string};
+use syntax::print::pprust::{
+    bounds_to_string,
+    generic_params_to_string,
+    path_to_string,
+    ty_to_string
+};
 use syntax::ptr::P;
-use syntax::codemap::Spanned;
+use syntax::codemap::{Spanned, DUMMY_SP};
 use syntax_pos::*;
 
 use {escape, generated_code, lower_attributes, PathCollector, SaveContext};
@@ -285,6 +290,7 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
             HirDef::Enum(..) |
             HirDef::TyAlias(..) |
             HirDef::TyForeign(..) |
+            HirDef::TraitAlias(..) |
             HirDef::Trait(_) => {
                 let span = self.span_from_span(sub_span.expect("No span found for type ref"));
                 self.dumper.dump_ref(Ref {
@@ -437,35 +443,37 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
         prefix: &str,
         id: NodeId,
     ) {
-        for param in &generics.ty_params {
-            let param_ss = param.span;
-            let name = escape(self.span.snippet(param_ss));
-            // Append $id to name to make sure each one is unique
-            let qualname = format!("{}::{}${}", prefix, name, id);
-            if !self.span.filter_generated(Some(param_ss), full_span) {
-                let id = ::id_from_node_id(param.id, &self.save_ctxt);
-                let span = self.span_from_span(param_ss);
+        for param in &generics.params {
+            if let ast::GenericParam::Type(ref ty_param) = *param {
+                let param_ss = ty_param.span;
+                let name = escape(self.span.snippet(param_ss));
+                // Append $id to name to make sure each one is unique
+                let qualname = format!("{}::{}${}", prefix, name, id);
+                if !self.span.filter_generated(Some(param_ss), full_span) {
+                    let id = ::id_from_node_id(ty_param.id, &self.save_ctxt);
+                    let span = self.span_from_span(param_ss);
 
-                self.dumper.dump_def(
-                    &Access {
-                        public: false,
-                        reachable: false,
-                    },
-                    Def {
-                        kind: DefKind::Type,
-                        id,
-                        span,
-                        name,
-                        qualname,
-                        value: String::new(),
-                        parent: None,
-                        children: vec![],
-                        decl_id: None,
-                        docs: String::new(),
-                        sig: None,
-                        attributes: vec![],
-                    },
-                );
+                    self.dumper.dump_def(
+                        &Access {
+                            public: false,
+                            reachable: false,
+                        },
+                        Def {
+                            kind: DefKind::Type,
+                            id,
+                            span,
+                            name,
+                            qualname,
+                            value: String::new(),
+                            parent: None,
+                            children: vec![],
+                            decl_id: None,
+                            docs: String::new(),
+                            sig: None,
+                            attributes: vec![],
+                        },
+                    );
+                }
             }
         }
         self.visit_generics(generics);
@@ -786,8 +794,8 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
         let name = item.ident.to_string();
         let qualname = format!("::{}", self.tcx.node_path_str(item.id));
         let mut val = name.clone();
-        if !generics.lifetimes.is_empty() || !generics.ty_params.is_empty() {
-            val.push_str(&generics_to_string(generics));
+        if !generics.params.is_empty() {
+            val.push_str(&generic_params_to_string(&generics.params));
         }
         if !trait_refs.is_empty() {
             val.push_str(": ");
@@ -1229,6 +1237,127 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> DumpVisitor<'l, 'tcx, 'll, O> {
             ast::ImplItemKind::Macro(_) => {}
         }
     }
+
+    /// Dumps imports in a use tree recursively.
+    ///
+    /// A use tree is an import that may contain nested braces (RFC 2128). The `use_tree` parameter
+    /// is the current use tree under scrutiny, while `id` and `prefix` are its corresponding node
+    /// id and path. `root_item` is the topmost use tree in the hierarchy.
+    ///
+    /// If `use_tree` is a simple or glob import, it is dumped into the analysis data. Otherwise,
+    /// each child use tree is dumped recursively.
+    fn process_use_tree(&mut self,
+                         use_tree: &'l ast::UseTree,
+                         id: NodeId,
+                         root_item: &'l ast::Item,
+                         prefix: &ast::Path) {
+        let path = &use_tree.prefix;
+
+        // The access is calculated using the current tree ID, but with the root tree's visibility
+        // (since nested trees don't have their own visibility).
+        let access = Access {
+            public: root_item.vis == ast::Visibility::Public,
+            reachable: self.save_ctxt.analysis.access_levels.is_reachable(id),
+        };
+
+        // The parent def id of a given use tree is always the enclosing item.
+        let parent = self.save_ctxt.tcx.hir.opt_local_def_id(id)
+            .and_then(|id| self.save_ctxt.tcx.parent_def_id(id))
+            .map(::id_from_def_id);
+
+        match use_tree.kind {
+            ast::UseTreeKind::Simple(ident) => {
+                let path = ast::Path {
+                    segments: prefix.segments
+                        .iter()
+                        .chain(path.segments.iter())
+                        .cloned()
+                        .collect(),
+                    span: path.span,
+                };
+
+                let sub_span = self.span.span_for_last_ident(path.span);
+                let mod_id = match self.lookup_def_id(id) {
+                    Some(def_id) => {
+                        self.process_def_kind(id, path.span, sub_span, def_id);
+                        Some(def_id)
+                    }
+                    None => None,
+                };
+
+                // 'use' always introduces an alias, if there is not an explicit
+                // one, there is an implicit one.
+                let sub_span = match self.span.sub_span_after_keyword(use_tree.span,
+                                                                      keywords::As) {
+                    Some(sub_span) => Some(sub_span),
+                    None => sub_span,
+                };
+
+                if !self.span.filter_generated(sub_span, path.span) {
+                    let span =
+                        self.span_from_span(sub_span.expect("No span found for use"));
+                    self.dumper.import(&access, Import {
+                        kind: ImportKind::Use,
+                        ref_id: mod_id.map(|id| ::id_from_def_id(id)),
+                        span,
+                        name: ident.to_string(),
+                        value: String::new(),
+                        parent,
+                    });
+                }
+                self.write_sub_paths_truncated(&path);
+            }
+            ast::UseTreeKind::Glob => {
+                let path = ast::Path {
+                    segments: prefix.segments
+                        .iter()
+                        .chain(path.segments.iter())
+                        .cloned()
+                        .collect(),
+                    span: path.span,
+                };
+
+                // Make a comma-separated list of names of imported modules.
+                let mut names = vec![];
+                let glob_map = &self.save_ctxt.analysis.glob_map;
+                let glob_map = glob_map.as_ref().unwrap();
+                if glob_map.contains_key(&id) {
+                    for n in glob_map.get(&id).unwrap() {
+                        names.push(n.to_string());
+                    }
+                }
+
+                let sub_span = self.span.sub_span_of_token(use_tree.span,
+                                                           token::BinOp(token::Star));
+                if !self.span.filter_generated(sub_span, use_tree.span) {
+                    let span =
+                        self.span_from_span(sub_span.expect("No span found for use glob"));
+                    self.dumper.import(&access, Import {
+                        kind: ImportKind::GlobUse,
+                        ref_id: None,
+                        span,
+                        name: "*".to_owned(),
+                        value: names.join(", "),
+                        parent,
+                    });
+                }
+                self.write_sub_paths(&path);
+            }
+            ast::UseTreeKind::Nested(ref nested_items) => {
+                let prefix = ast::Path {
+                    segments: prefix.segments
+                        .iter()
+                        .chain(path.segments.iter())
+                        .cloned()
+                        .collect(),
+                    span: path.span,
+                };
+                for &(ref tree, id) in nested_items {
+                    self.process_use_tree(tree, id, root_item, &prefix);
+                }
+            }
+        }
+    }
 }
 
 impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tcx, 'll, O> {
@@ -1259,7 +1388,7 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
                 name: String::new(),
                 qualname,
                 span,
-                value: filename,
+                value: filename.to_string(),
                 children,
                 parent: None,
                 decl_id: None,
@@ -1275,86 +1404,12 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
         use syntax::ast::ItemKind::*;
         self.process_macro_use(item.span);
         match item.node {
-            Use(ref use_item) => {
-                let access = access_from!(self.save_ctxt, item);
-
-                match use_item.node {
-                    ast::ViewPathSimple(ident, ref path) => {
-                        let sub_span = self.span.span_for_last_ident(path.span);
-                        let mod_id = match self.lookup_def_id(item.id) {
-                            Some(def_id) => {
-                                self.process_def_kind(item.id, path.span, sub_span, def_id);
-                                Some(def_id)
-                            }
-                            None => None,
-                        };
-
-                        // 'use' always introduces an alias, if there is not an explicit
-                        // one, there is an implicit one.
-                        let sub_span = match self.span
-                            .sub_span_after_keyword(use_item.span, keywords::As)
-                        {
-                            Some(sub_span) => Some(sub_span),
-                            None => sub_span,
-                        };
-
-                        if !self.span.filter_generated(sub_span, path.span) {
-                            let span =
-                                self.span_from_span(sub_span.expect("No span found for use"));
-                            self.dumper.import(
-                                &access,
-                                Import {
-                                    kind: ImportKind::Use,
-                                    ref_id: mod_id.map(|id| ::id_from_def_id(id)),
-                                    span,
-                                    name: ident.to_string(),
-                                    value: String::new(),
-                                },
-                            );
-                        }
-                        self.write_sub_paths_truncated(path);
-                    }
-                    ast::ViewPathGlob(ref path) => {
-                        // Make a comma-separated list of names of imported modules.
-                        let mut names = vec![];
-                        let glob_map = &self.save_ctxt.analysis.glob_map;
-                        let glob_map = glob_map.as_ref().unwrap();
-                        if glob_map.contains_key(&item.id) {
-                            for n in glob_map.get(&item.id).unwrap() {
-                                names.push(n.to_string());
-                            }
-                        }
-
-                        let sub_span = self.span
-                            .sub_span_of_token(item.span, token::BinOp(token::Star));
-                        if !self.span.filter_generated(sub_span, item.span) {
-                            let span =
-                                self.span_from_span(sub_span.expect("No span found for use glob"));
-                            self.dumper.import(
-                                &access,
-                                Import {
-                                    kind: ImportKind::GlobUse,
-                                    ref_id: None,
-                                    span,
-                                    name: "*".to_owned(),
-                                    value: names.join(", "),
-                                },
-                            );
-                        }
-                        self.write_sub_paths(path);
-                    }
-                    ast::ViewPathList(ref path, ref list) => {
-                        for plid in list {
-                            let id = plid.node.id;
-                            if let Some(def_id) = self.lookup_def_id(id) {
-                                let span = plid.span;
-                                self.process_def_kind(id, span, Some(span), def_id);
-                            }
-                        }
-
-                        self.write_sub_paths(path);
-                    }
-                }
+            Use(ref use_tree) => {
+                let prefix = ast::Path {
+                    segments: vec![],
+                    span: DUMMY_SP,
+                };
+                self.process_use_tree(use_tree, item.id, item, &prefix);
             }
             ExternCrate(_) => {
                 let alias_span = self.span.span_for_last_ident(item.span);
@@ -1362,6 +1417,9 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
                 if !self.span.filter_generated(alias_span, item.span) {
                     let span =
                         self.span_from_span(alias_span.expect("No span found for extern crate"));
+                    let parent = self.save_ctxt.tcx.hir.opt_local_def_id(item.id)
+                        .and_then(|id| self.save_ctxt.tcx.parent_def_id(id))
+                        .map(::id_from_def_id);
                     self.dumper.import(
                         &Access {
                             public: false,
@@ -1373,6 +1431,7 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
                             span,
                             name: item.ident.to_string(),
                             value: String::new(),
+                            parent,
                         },
                     );
                 }
@@ -1432,14 +1491,16 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
     }
 
     fn visit_generics(&mut self, generics: &'l ast::Generics) {
-        for param in generics.ty_params.iter() {
-            for bound in param.bounds.iter() {
-                if let ast::TraitTyParamBound(ref trait_ref, _) = *bound {
-                    self.process_path(trait_ref.trait_ref.ref_id, &trait_ref.trait_ref.path)
+        for param in &generics.params {
+            if let ast::GenericParam::Type(ref ty_param) = *param {
+                for bound in ty_param.bounds.iter() {
+                    if let ast::TraitTyParamBound(ref trait_ref, _) = *bound {
+                        self.process_path(trait_ref.trait_ref.ref_id, &trait_ref.trait_ref.path)
+                    }
                 }
-            }
-            if let Some(ref ty) = param.default {
-                self.visit_ty(&ty);
+                if let Some(ref ty) = ty_param.default {
+                    self.visit_ty(&ty);
+                }
             }
         }
     }
@@ -1528,10 +1589,12 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
                         if !self.span.filter_generated(sub_span, ex.span) {
                             let span =
                                 self.span_from_span(sub_span.expect("No span found for var ref"));
+                            let ref_id =
+                                ::id_from_def_id(def.non_enum_variant().fields[idx.node].did);
                             self.dumper.dump_ref(Ref {
                                 kind: RefKind::Variable,
                                 span,
-                                ref_id: ::id_from_def_id(def.struct_variant().fields[idx.node].did),
+                                ref_id,
                             });
                         }
                     }
@@ -1539,7 +1602,7 @@ impl<'l, 'tcx: 'l, 'll, O: DumpOutput + 'll> Visitor<'l> for DumpVisitor<'l, 'tc
                     _ => span_bug!(ex.span, "Expected struct or tuple type, found {:?}", ty),
                 }
             }
-            ast::ExprKind::Closure(_, ref decl, ref body, _fn_decl_span) => {
+            ast::ExprKind::Closure(_, _, ref decl, ref body, _fn_decl_span) => {
                 let mut id = String::from("$");
                 id.push_str(&ex.id.to_string());
 

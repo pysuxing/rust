@@ -441,7 +441,7 @@ fn read_to_end<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>) -> Result<usize> 
 /// # }
 /// ```
 ///
-/// Read from `&str` because [`&[u8]`] implements [`Read`]:
+/// Read from [`&str`] because [`&[u8]`][slice] implements `Read`:
 ///
 /// ```
 /// # use std::io;
@@ -464,8 +464,8 @@ fn read_to_end<R: Read + ?Sized>(r: &mut R, buf: &mut Vec<u8>) -> Result<usize> 
 /// [`File`]: ../fs/struct.File.html
 /// [`BufRead`]: trait.BufRead.html
 /// [`BufReader`]: struct.BufReader.html
-/// [`&[u8]`]: primitive.slice.html
-///
+/// [`&str`]: ../../std/primitive.str.html
+/// [slice]: ../../std/primitive.slice.html
 #[stable(feature = "rust1", since = "1.0.0")]
 #[doc(spotlight)]
 pub trait Read {
@@ -601,7 +601,7 @@ pub trait Read {
         read_to_end(self, buf)
     }
 
-    /// Read all bytes until EOF in this source, placing them into `buf`.
+    /// Read all bytes until EOF in this source, appending them to `buf`.
     ///
     /// If successful, this function returns the number of bytes which were read
     /// and appended to `buf`.
@@ -997,9 +997,9 @@ pub trait Write {
     ///
     /// Calls to `write` are not guaranteed to block waiting for data to be
     /// written, and a write which would otherwise block can be indicated through
-    /// an `Err` variant.
+    /// an [`Err`] variant.
     ///
-    /// If the return value is `Ok(n)` then it must be guaranteed that
+    /// If the return value is [`Ok(n)`] then it must be guaranteed that
     /// `0 <= n <= buf.len()`. A return value of `0` typically means that the
     /// underlying object is no longer able to accept bytes and will likely not
     /// be able to in the future as well, or that the buffer provided is empty.
@@ -1013,8 +1013,12 @@ pub trait Write {
     /// It is **not** considered an error if the entire buffer could not be
     /// written to this writer.
     ///
-    /// An error of the `ErrorKind::Interrupted` kind is non-fatal and the
+    /// An error of the [`ErrorKind::Interrupted`] kind is non-fatal and the
     /// write operation should be retried if there is nothing else to do.
+    ///
+    /// [`Err`]: ../../std/result/enum.Result.html#variant.Err
+    /// [`Ok(n)`]:  ../../std/result/enum.Result.html#variant.Ok
+    /// [`ErrorKind::Interrupted`]: ../../std/io/enum.ErrorKind.html#variant.Interrupted
     ///
     /// # Examples
     ///
@@ -1061,17 +1065,20 @@ pub trait Write {
 
     /// Attempts to write an entire buffer into this write.
     ///
-    /// This method will continuously call `write` until there is no more data
-    /// to be written or an error of non-`ErrorKind::Interrupted` kind is
+    /// This method will continuously call [`write`] until there is no more data
+    /// to be written or an error of non-[`ErrorKind::Interrupted`] kind is
     /// returned. This method will not return until the entire buffer has been
     /// successfully written or such an error occurs. The first error that is
-    /// not of `ErrorKind::Interrupted` kind generated from this method will be
+    /// not of [`ErrorKind::Interrupted`] kind generated from this method will be
     /// returned.
     ///
     /// # Errors
     ///
     /// This function will return the first error of
-    /// non-`ErrorKind::Interrupted` kind that `write` returns.
+    /// non-[`ErrorKind::Interrupted`] kind that [`write`] returns.
+    ///
+    /// [`ErrorKind::Interrupted`]: ../../std/io/enum.ErrorKind.html#variant.Interrupted
+    /// [`write`]: #tymethod.write
     ///
     /// # Examples
     ///
@@ -2020,10 +2027,9 @@ impl<R: Read> Iterator for Chars<R> {
     type Item = result::Result<char, CharsError>;
 
     fn next(&mut self) -> Option<result::Result<char, CharsError>> {
-        let first_byte = match read_one_byte(&mut self.inner) {
-            None => return None,
-            Some(Ok(b)) => b,
-            Some(Err(e)) => return Some(Err(CharsError::Other(e))),
+        let first_byte = match read_one_byte(&mut self.inner)? {
+            Ok(b) => b,
+            Err(e) => return Some(Err(CharsError::Other(e))),
         };
         let width = core_str::utf8_char_width(first_byte);
         if width == 1 { return Some(Ok(first_byte as char)) }

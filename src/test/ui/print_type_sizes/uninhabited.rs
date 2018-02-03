@@ -9,10 +9,14 @@
 // except according to those terms.
 
 // compile-flags: -Z print-type-sizes
+// must-compile-successfully
 
 #![feature(never_type)]
+#![feature(start)]
 
-pub fn main() {
+#[start]
+fn start(_: isize, _: *const *const u8) -> isize {
     let _x: Option<!> = None;
     let _y: Result<u32, !> = Ok(42);
+    0
 }

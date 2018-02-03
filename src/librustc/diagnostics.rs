@@ -359,18 +359,21 @@ lifetime elision rules (see below).
 Here are some simple examples of where you'll run into this error:
 
 ```compile_fail,E0106
-struct Foo { x: &bool }        // error
-struct Foo<'a> { x: &'a bool } // correct
+struct Foo1 { x: &bool }
+              // ^ expected lifetime parameter
+struct Foo2<'a> { x: &'a bool } // correct
 
-struct Bar { x: Foo }
-               ^^^ expected lifetime parameter
-struct Bar<'a> { x: Foo<'a> } // correct
+struct Bar1 { x: Foo2 }
+              // ^^^^ expected lifetime parameter
+struct Bar2<'a> { x: Foo2<'a> } // correct
 
-enum Bar { A(u8), B(&bool), }        // error
-enum Bar<'a> { A(u8), B(&'a bool), } // correct
+enum Baz1 { A(u8), B(&bool), }
+                  // ^ expected lifetime parameter
+enum Baz2<'a> { A(u8), B(&'a bool), } // correct
 
-type MyStr = &str;        // error
-type MyStr<'a> = &'a str; // correct
+type MyStr1 = &str;
+           // ^ expected lifetime parameter
+type MyStr2<'a> = &'a str; // correct
 ```
 
 Lifetime elision is a special, limited kind of inference for lifetimes in
@@ -1641,14 +1644,14 @@ impl Foo {
 These attributes do not work on typedefs, since typedefs are just aliases.
 
 Representations like `#[repr(u8)]`, `#[repr(i64)]` are for selecting the
-discriminant size for C-like enums (when there is no associated data, e.g.
-`enum Color {Red, Blue, Green}`), effectively setting the size of the enum to
+discriminant size for enums with no data fields on any of the variants, e.g.
+`enum Color {Red, Blue, Green}`, effectively setting the size of the enum to
 the size of the provided type. Such an enum can be cast to a value of the same
 type as well. In short, `#[repr(u8)]` makes the enum behave like an integer
 with a constrained set of allowed values.
 
-Only C-like enums can be cast to numerical primitives, so this attribute will
-not apply to structs.
+Only field-less enums can be cast to numerical primitives, so this attribute
+will not apply to structs.
 
 `#[repr(packed)]` reduces padding to make the struct size smaller. The
 representation of enums isn't strictly defined in Rust, and this attribute
@@ -2000,7 +2003,69 @@ that refers to itself. That is permitting, since the closure would be
 invoking itself via a virtual call, and hence does not directly
 reference its own *type*.
 
-"##, }
+"##,
+
+E0692: r##"
+A `repr(transparent)` type was also annotated with other, incompatible
+representation hints.
+
+Erroneous code example:
+
+```compile_fail,E0692
+#![feature(repr_transparent)]
+
+#[repr(transparent, C)] // error: incompatible representation hints
+struct Grams(f32);
+```
+
+A type annotated as `repr(transparent)` delegates all representation concerns to
+another type, so adding more representation hints is contradictory. Remove
+either the `transparent` hint or the other hints, like this:
+
+```
+#![feature(repr_transparent)]
+
+#[repr(transparent)]
+struct Grams(f32);
+```
+
+Alternatively, move the other attributes to the contained type:
+
+```
+#![feature(repr_transparent)]
+
+#[repr(C)]
+struct Foo {
+    x: i32,
+    // ...
+}
+
+#[repr(transparent)]
+struct FooWrapper(Foo);
+```
+
+Note that introducing another `struct` just to have a place for the other
+attributes may have unintended side effects on the representation:
+
+```
+#![feature(repr_transparent)]
+
+#[repr(transparent)]
+struct Grams(f32);
+
+#[repr(C)]
+struct Float(f32);
+
+#[repr(transparent)]
+struct Grams2(Float); // this is not equivalent to `Grams` above
+```
+
+Here, `Grams2` is a not equivalent to `Grams` -- the former transparently wraps
+a (non-transparent) struct containing a single float, while `Grams` is a
+transparent wrapper around a float. This can make a difference for the ABI.
+"##,
+
+}
 
 
 register_diagnostics! {
@@ -2053,4 +2118,6 @@ register_diagnostics! {
     E0657, // `impl Trait` can only capture lifetimes bound at the fn level
     E0687, // in-band lifetimes cannot be used in `fn`/`Fn` syntax
     E0688, // in-band lifetimes cannot be mixed with explicit lifetime binders
+
+    E0906, // closures cannot be static
 }

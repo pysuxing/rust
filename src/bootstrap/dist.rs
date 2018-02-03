@@ -28,7 +28,7 @@ use build_helper::output;
 
 use {Build, Compiler, Mode};
 use channel;
-use util::{cp_r, libdir, is_dylib, cp_filtered, copy};
+use util::{cp_r, libdir, is_dylib, cp_filtered, copy, replace_in_file};
 use builder::{Builder, RunConfig, ShouldRun, Step};
 use compile;
 use tool::{self, Tool};
@@ -224,6 +224,8 @@ fn make_win_dist(
         "libwinspool.a",
         "libws2_32.a",
         "libwsock32.a",
+        "libdbghelp.a",
+        "libmsimg32.a",
     ];
 
     //Find mingw artifacts we want to bundle
@@ -432,9 +434,31 @@ impl Step for Rustc {
                 }
             }
 
+            // Copy over the codegen backends
+            let backends_src = builder.sysroot_codegen_backends(compiler);
+            let backends_rel = backends_src.strip_prefix(&src).unwrap();
+            let backends_dst = image.join(&backends_rel);
+            t!(fs::create_dir_all(&backends_dst));
+            cp_r(&backends_src, &backends_dst);
+
             // Man pages
             t!(fs::create_dir_all(image.join("share/man/man1")));
-            cp_r(&build.src.join("src/doc/man"), &image.join("share/man/man1"));
+            let man_src = build.src.join("src/doc/man");
+            let man_dst = image.join("share/man/man1");
+            let date_output = output(Command::new("date").arg("+%B %Y"));
+            let month_year = date_output.trim();
+            // don't use our `bootstrap::util::{copy, cp_r}`, because those try
+            // to hardlink, and we don't want to edit the source templates
+            for entry_result in t!(fs::read_dir(man_src)) {
+                let file_entry = t!(entry_result);
+                let page_src = file_entry.path();
+                let page_dst = man_dst.join(file_entry.file_name());
+                t!(fs::copy(&page_src, &page_dst));
+                // template in month/year and version number
+                replace_in_file(&page_dst,
+                                &[("<INSERT DATE HERE>", month_year),
+                                  ("<INSERT VERSION HERE>", channel::CFG_RELEASE_NUM)]);
+            }
 
             // Debugger scripts
             builder.ensure(DebuggerScripts {
@@ -489,6 +513,7 @@ impl Step for DebuggerScripts {
             install(&build.src.join("src/etc/rust-windbg.cmd"), &sysroot.join("bin"),
                 0o755);
 
+            cp_debugger_script("natvis/intrinsic.natvis");
             cp_debugger_script("natvis/liballoc.natvis");
             cp_debugger_script("natvis/libcore.natvis");
         } else {
@@ -563,7 +588,9 @@ impl Step for Std {
         t!(fs::create_dir_all(&dst));
         let mut src = builder.sysroot_libdir(compiler, target).to_path_buf();
         src.pop(); // Remove the trailing /lib folder from the sysroot_libdir
-        cp_r(&src, &dst);
+        cp_filtered(&src, &dst, &|path| {
+            path.file_name().and_then(|s| s.to_str()) != Some("codegen-backends")
+        });
 
         let mut cmd = rust_installer(builder);
         cmd.arg("generate")
@@ -1061,11 +1088,6 @@ impl Step for Rls {
         let target = self.target;
         assert!(build.config.extended);
 
-        if !builder.config.toolstate.rls.testing() {
-            println!("skipping Dist RLS stage{} ({})", stage, target);
-            return None
-        }
-
         println!("Dist RLS stage{} ({})", stage, target);
         let src = build.src.join("src/tools/rls");
         let release_num = build.release_num("rls");
@@ -1083,7 +1105,8 @@ impl Step for Rls {
         let rls = builder.ensure(tool::Rls {
             compiler: builder.compiler(stage, build.build),
             target
-        }).expect("Rls to build: toolstate is testing");
+        }).or_else(|| { println!("Unable to build RLS, skipping dist"); None })?;
+
         install(&rls, &image.join("bin"), 0o755);
         let doc = image.join("share/doc/rls");
         install(&src.join("README.md"), &doc, 0o644);
@@ -1147,11 +1170,6 @@ impl Step for Rustfmt {
         let target = self.target;
         assert!(build.config.extended);
 
-        if !builder.config.toolstate.rustfmt.testing() {
-            println!("skipping Dist Rustfmt stage{} ({})", stage, target);
-            return None
-        }
-
         println!("Dist Rustfmt stage{} ({})", stage, target);
         let src = build.src.join("src/tools/rustfmt");
         let release_num = build.release_num("rustfmt");
@@ -1167,11 +1185,12 @@ impl Step for Rustfmt {
         let rustfmt = builder.ensure(tool::Rustfmt {
             compiler: builder.compiler(stage, build.build),
             target
-        }).expect("Rustfmt to build: toolstate is testing");
+        }).or_else(|| { println!("Unable to build Rustfmt, skipping dist"); None })?;
         let cargofmt = builder.ensure(tool::Cargofmt {
             compiler: builder.compiler(stage, build.build),
             target
-        }).expect("Cargofmt to build: toolstate is testing");
+        }).or_else(|| { println!("Unable to build Cargofmt, skipping dist"); None })?;
+
         install(&rustfmt, &image.join("bin"), 0o755);
         install(&cargofmt, &image.join("bin"), 0o755);
         let doc = image.join("share/doc/rustfmt");
@@ -1642,7 +1661,6 @@ fn add_env(build: &Build, cmd: &mut Command, target: Interned<String>) {
     cmd.env("CFG_RELEASE_INFO", build.rust_version())
        .env("CFG_RELEASE_NUM", channel::CFG_RELEASE_NUM)
        .env("CFG_RELEASE", build.rust_release())
-       .env("CFG_PRERELEASE_VERSION", channel::CFG_PRERELEASE_VERSION)
        .env("CFG_VER_MAJOR", parts.next().unwrap())
        .env("CFG_VER_MINOR", parts.next().unwrap())
        .env("CFG_VER_PATCH", parts.next().unwrap())

@@ -26,6 +26,7 @@ pub struct EarlyProps {
     pub ignore: bool,
     pub should_fail: bool,
     pub aux: Vec<String>,
+    pub revisions: Vec<String>,
 }
 
 impl EarlyProps {
@@ -34,20 +35,29 @@ impl EarlyProps {
             ignore: false,
             should_fail: false,
             aux: Vec::new(),
+            revisions: vec![],
         };
 
         iter_header(testfile,
                     None,
                     &mut |ln| {
+            // we should check if any only-<platform> exists and if it exists
+            // and does not matches the current platform, skip the test
             props.ignore =
                 props.ignore ||
                 config.parse_cfg_name_directive(ln, "ignore") ||
+                (config.has_cfg_prefix(ln, "only") &&
+                !config.parse_cfg_name_directive(ln, "only")) ||
                 ignore_gdb(config, ln) ||
                 ignore_lldb(config, ln) ||
                 ignore_llvm(config, ln);
 
             if let Some(s) = config.parse_aux_build(ln) {
                 props.aux.push(s);
+            }
+
+            if let Some(r) = config.parse_revisions(ln) {
+                props.revisions.extend(r);
             }
 
             props.should_fail = props.should_fail || config.parse_name_directive(ln, "should-fail");
@@ -212,7 +222,7 @@ pub struct TestProps {
     // testing harness and used when generating compilation
     // arguments. (In particular, it propagates to the aux-builds.)
     pub incremental_dir: Option<PathBuf>,
-    // Specifies that a cfail test must actually compile without errors.
+    // Specifies that a test must actually compile without errors.
     pub must_compile_successfully: bool,
     // rustdoc will test the output of the `--test` option
     pub check_test_line_numbers_match: bool,
@@ -353,16 +363,18 @@ impl TestProps {
                 self.forbid_output.push(of);
             }
 
-            if !self.must_compile_successfully {
-                self.must_compile_successfully = config.parse_must_compile_successfully(ln);
-            }
-
             if !self.check_test_line_numbers_match {
                 self.check_test_line_numbers_match = config.parse_check_test_line_numbers_match(ln);
             }
 
             if !self.run_pass {
                 self.run_pass = config.parse_run_pass(ln);
+            }
+
+            if !self.must_compile_successfully {
+                // run-pass implies must_compile_sucessfully
+                self.must_compile_successfully =
+                    config.parse_must_compile_successfully(ln) || self.run_pass;
             }
 
             if let Some(rule) = config.parse_custom_normalization(ln, "normalize-stdout") {
@@ -554,6 +566,13 @@ impl Config {
         } else {
             false
         }
+    }
+
+    fn has_cfg_prefix(&self, line: &str, prefix: &str) -> bool {
+        // returns whether this line contains this prefix or not. For prefix
+        // "ignore", returns true if line says "ignore-x86_64", "ignore-arch",
+        // "ignore-andorid" etc.
+        line.starts_with(prefix) && line.as_bytes().get(prefix.len()) == Some(&b'-')
     }
 
     fn parse_name_directive(&self, line: &str, directive: &str) -> bool {

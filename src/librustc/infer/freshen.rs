@@ -113,6 +113,13 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
                 // replace all free regions with 'erased
                 self.tcx().types.re_erased
             }
+
+            ty::ReClosureBound(..) => {
+                bug!(
+                    "encountered unexpected ReClosureBound: {:?}",
+                    r,
+                );
+            }
         }
     }
 
@@ -185,6 +192,7 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
             ty::TyForeign(..) |
             ty::TyParam(..) |
             ty::TyClosure(..) |
+            ty::TyGeneratorWitness(..) |
             ty::TyAnon(..) => {
                 t.super_fold_with(self)
             }

@@ -125,11 +125,6 @@ fn main() {
             cmd.arg(format!("-Clinker={}", target_linker));
         }
 
-        // Pass down incremental directory, if any.
-        if let Ok(dir) = env::var("RUSTC_INCREMENTAL") {
-            cmd.arg(format!("-Zincremental={}", dir));
-        }
-
         let crate_name = args.windows(2)
             .find(|a| &*a[0] == "--crate-name")
             .unwrap();
@@ -175,7 +170,7 @@ fn main() {
         if let Ok(s) = env::var("RUSTC_CODEGEN_UNITS") {
             cmd.arg("-C").arg(format!("codegen-units={}", s));
         }
-        if stage != "0" && env::var("RUSTC_THINLTO").is_ok() {
+        if env::var("RUSTC_THINLTO").is_ok() {
             cmd.arg("-Ccodegen-units=16").arg("-Zthinlto");
         }
 
@@ -246,6 +241,9 @@ fn main() {
         // When running miri tests, we need to generate MIR for all libraries
         if env::var("TEST_MIRI").ok().map_or(false, |val| val == "true") {
             cmd.arg("-Zalways-encode-mir");
+            if stage != "0" {
+                cmd.arg("-Zmiri");
+            }
             cmd.arg("-Zmir-emit-validate=1");
         }
 
@@ -260,6 +258,10 @@ fn main() {
         if let Ok(host_linker) = env::var("RUSTC_HOST_LINKER") {
             cmd.arg(format!("-Clinker={}", host_linker));
         }
+    }
+
+    if env::var_os("RUSTC_PARALLEL_QUERIES").is_some() {
+        cmd.arg("--cfg").arg("parallel_queries");
     }
 
     let color = match env::var("RUSTC_COLOR") {

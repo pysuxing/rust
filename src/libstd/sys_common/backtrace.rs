@@ -41,6 +41,8 @@ pub struct Frame {
     pub exact_position: *const u8,
     /// Address of the enclosing function.
     pub symbol_addr: *const u8,
+    /// Which inlined function is this frame referring to
+    pub inline_context: u32,
 }
 
 /// Max number of frames to print.
@@ -64,6 +66,7 @@ fn _print(w: &mut Write, format: PrintFormat) -> io::Result<()> {
     let mut frames = [Frame {
         exact_position: ptr::null(),
         symbol_addr: ptr::null(),
+        inline_context: 0,
     }; MAX_NB_FRAMES];
     let (nb_frames, context) = unwind_backtrace(&mut frames)?;
     let (skipped_before, skipped_after) =
@@ -128,7 +131,7 @@ fn filter_frames(frames: &[Frame],
 /// Fixed frame used to clean the backtrace with `RUST_BACKTRACE=1`.
 #[inline(never)]
 pub fn __rust_begin_short_backtrace<F, T>(f: F) -> T
-    where F: FnOnce() -> T, F: Send + 'static, T: Send + 'static
+    where F: FnOnce() -> T, F: Send, T: Send
 {
     f()
 }
@@ -252,8 +255,26 @@ fn output_fileline(w: &mut Write,
 // Note that this demangler isn't quite as fancy as it could be. We have lots
 // of other information in our symbols like hashes, version, type information,
 // etc. Additionally, this doesn't handle glue symbols at all.
-pub fn demangle(writer: &mut Write, s: &str, format: PrintFormat) -> io::Result<()> {
-    // First validate the symbol. If it doesn't look like anything we're
+pub fn demangle(writer: &mut Write, mut s: &str, format: PrintFormat) -> io::Result<()> {
+    // During ThinLTO LLVM may import and rename internal symbols, so strip out
+    // those endings first as they're one of the last manglings applied to
+    // symbol names.
+    let llvm = ".llvm.";
+    if let Some(i) = s.find(llvm) {
+        let candidate = &s[i + llvm.len()..];
+        let all_hex = candidate.chars().all(|c| {
+            match c {
+                'A' ... 'F' | '0' ... '9' => true,
+                _ => false,
+            }
+        });
+
+        if all_hex {
+            s = &s[..i];
+        }
+    }
+
+    // Validate the symbol. If it doesn't look like anything we're
     // expecting, we just print it literally. Note that we must handle non-rust
     // symbols because we could have any function in the backtrace.
     let mut valid = true;

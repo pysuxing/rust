@@ -11,7 +11,7 @@
 //! misc. type-system utilities too small to deserve their own file
 
 use hir::def::Def;
-use hir::def_id::{DefId, LOCAL_CRATE};
+use hir::def_id::DefId;
 use hir::map::{DefPathData, Node};
 use hir;
 use ich::NodeIdHashingMode;
@@ -29,7 +29,6 @@ use rustc_data_structures::stable_hasher::{StableHasher, StableHasherResult,
                                            HashStable};
 use rustc_data_structures::fx::FxHashMap;
 use std::cmp;
-use std::iter;
 use std::hash::Hash;
 use std::intrinsics;
 use syntax::ast::{self, Name};
@@ -55,7 +54,7 @@ macro_rules! typed_literal {
             SignedInt(ast::IntTy::I32)   => ConstInt::I32($lit),
             SignedInt(ast::IntTy::I64)   => ConstInt::I64($lit),
             SignedInt(ast::IntTy::I128)   => ConstInt::I128($lit),
-            SignedInt(ast::IntTy::Is) => match $tcx.sess.target.isize_ty {
+            SignedInt(ast::IntTy::Isize) => match $tcx.sess.target.isize_ty {
                 ast::IntTy::I16 => ConstInt::Isize(ConstIsize::Is16($lit)),
                 ast::IntTy::I32 => ConstInt::Isize(ConstIsize::Is32($lit)),
                 ast::IntTy::I64 => ConstInt::Isize(ConstIsize::Is64($lit)),
@@ -66,7 +65,7 @@ macro_rules! typed_literal {
             UnsignedInt(ast::UintTy::U32) => ConstInt::U32($lit),
             UnsignedInt(ast::UintTy::U64) => ConstInt::U64($lit),
             UnsignedInt(ast::UintTy::U128) => ConstInt::U128($lit),
-            UnsignedInt(ast::UintTy::Us) => match $tcx.sess.target.usize_ty {
+            UnsignedInt(ast::UintTy::Usize) => match $tcx.sess.target.usize_ty {
                 ast::UintTy::U16 => ConstInt::Usize(ConstUsize::Us16($lit)),
                 ast::UintTy::U32 => ConstInt::Usize(ConstUsize::Us32($lit)),
                 ast::UintTy::U64 => ConstInt::Usize(ConstUsize::Us64($lit)),
@@ -84,13 +83,13 @@ impl IntTypeExt for attr::IntType {
             SignedInt(ast::IntTy::I32)     => tcx.types.i32,
             SignedInt(ast::IntTy::I64)     => tcx.types.i64,
             SignedInt(ast::IntTy::I128)     => tcx.types.i128,
-            SignedInt(ast::IntTy::Is)   => tcx.types.isize,
+            SignedInt(ast::IntTy::Isize)   => tcx.types.isize,
             UnsignedInt(ast::UintTy::U8)    => tcx.types.u8,
             UnsignedInt(ast::UintTy::U16)   => tcx.types.u16,
             UnsignedInt(ast::UintTy::U32)   => tcx.types.u32,
             UnsignedInt(ast::UintTy::U64)   => tcx.types.u64,
             UnsignedInt(ast::UintTy::U128)   => tcx.types.u128,
-            UnsignedInt(ast::UintTy::Us) => tcx.types.usize,
+            UnsignedInt(ast::UintTy::Usize) => tcx.types.usize,
         }
     }
 
@@ -105,13 +104,13 @@ impl IntTypeExt for attr::IntType {
             (SignedInt(ast::IntTy::I32), ConstInt::I32(_)) => {},
             (SignedInt(ast::IntTy::I64), ConstInt::I64(_)) => {},
             (SignedInt(ast::IntTy::I128), ConstInt::I128(_)) => {},
-            (SignedInt(ast::IntTy::Is), ConstInt::Isize(_)) => {},
+            (SignedInt(ast::IntTy::Isize), ConstInt::Isize(_)) => {},
             (UnsignedInt(ast::UintTy::U8), ConstInt::U8(_)) => {},
             (UnsignedInt(ast::UintTy::U16), ConstInt::U16(_)) => {},
             (UnsignedInt(ast::UintTy::U32), ConstInt::U32(_)) => {},
             (UnsignedInt(ast::UintTy::U64), ConstInt::U64(_)) => {},
             (UnsignedInt(ast::UintTy::U128), ConstInt::U128(_)) => {},
-            (UnsignedInt(ast::UintTy::Us), ConstInt::Usize(_)) => {},
+            (UnsignedInt(ast::UintTy::Usize), ConstInt::Usize(_)) => {},
             _ => bug!("disr type mismatch: {:?} vs {:?}", self, val),
         }
     }
@@ -258,7 +257,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                 adt.variant_with_id(vid).fields.get(i).map(|f| f.ty(self, substs))
             }
             (&TyAdt(adt, substs), None) => {
-                // Don't use `struct_variant`, this may be a univariant enum.
+                // Don't use `non_enum_variant`, this may be a univariant enum.
                 adt.variants[0].fields.get(i).map(|f| f.ty(self, substs))
             }
             (&TyTuple(ref v, _), None) => v.get(i).cloned(),
@@ -277,7 +276,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                 adt.variant_with_id(vid).find_field_named(n).map(|f| f.ty(self, substs))
             }
             (&TyAdt(adt, substs), None) => {
-                adt.struct_variant().find_field_named(n).map(|f| f.ty(self, substs))
+                adt.non_enum_variant().find_field_named(n).map(|f| f.ty(self, substs))
             }
             _ => return None
         }
@@ -293,7 +292,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                     if !def.is_struct() {
                         break;
                     }
-                    match def.struct_variant().fields.last() {
+                    match def.non_enum_variant().fields.last() {
                         Some(f) => ty = f.ty(self, substs),
                         None => break,
                     }
@@ -329,7 +328,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             match (&a.sty, &b.sty) {
                 (&TyAdt(a_def, a_substs), &TyAdt(b_def, b_substs))
                         if a_def == b_def && a_def.is_struct() => {
-                    if let Some(f) = a_def.struct_variant().fields.last() {
+                    if let Some(f) = a_def.non_enum_variant().fields.last() {
                         a = f.ty(self, a_substs);
                         b = f.ty(self, b_substs);
                     } else {
@@ -427,7 +426,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             return None;
         };
 
-        self.coherent_trait((LOCAL_CRATE, drop_trait));
+        ty::maps::queries::coherent_trait::ensure(self, drop_trait);
 
         let mut dtor_did = None;
         let ty = self.type_of(adt_did);
@@ -439,12 +438,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             }
         });
 
-        let dtor_did = match dtor_did {
-            Some(dtor) => dtor,
-            None => return None,
-        };
-
-        Some(ty::Destructor { did: dtor_did })
+        Some(ty::Destructor { did: dtor_did? })
     }
 
     /// Return the set of types that are required to be alive in
@@ -555,7 +549,8 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         let result = match ty.sty {
             ty::TyBool | ty::TyChar | ty::TyInt(_) | ty::TyUint(_) |
             ty::TyFloat(_) | ty::TyStr | ty::TyNever | ty::TyForeign(..) |
-            ty::TyRawPtr(..) | ty::TyRef(..) | ty::TyFnDef(..) | ty::TyFnPtr(_) => {
+            ty::TyRawPtr(..) | ty::TyRef(..) | ty::TyFnDef(..) | ty::TyFnPtr(_) |
+            ty::TyGeneratorWitness(..) => {
                 // these types never have a destructor
                 Ok(ty::DtorckConstraint::empty())
             }
@@ -577,8 +572,11 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                 }).collect()
             }
 
-            ty::TyGenerator(def_id, substs, interior) => {
-                substs.upvar_tys(def_id, self).chain(iter::once(interior.witness)).map(|ty| {
+            ty::TyGenerator(def_id, substs, _) => {
+                // Note that the interior types are ignored here.
+                // Any type reachable inside the interior must also be reachable
+                // through the upvars.
+                substs.upvar_tys(def_id, self).map(|ty| {
                     self.dtorck_constraint_for_ty(span, for_ty, depth+1, ty)
                 }).collect()
             }
@@ -624,6 +622,13 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         self.def_key(def_id).disambiguated_data.data == DefPathData::ClosureExpr
     }
 
+    /// Given the `DefId` of a fn or closure, returns the `DefId` of
+    /// the innermost fn item that the closure is contained within.
+    /// This is a significant def-id because, when we do
+    /// type-checking, we type-check this fn item and all of its
+    /// (transitive) closures together.  Therefore, when we fetch the
+    /// `typeck_tables_of` the closure, for example, we really wind up
+    /// fetching the `typeck_tables_of` the enclosing fn item.
     pub fn closure_base_def_id(self, def_id: DefId) -> DefId {
         let mut def_id = def_id;
         while self.is_closure(def_id) {
@@ -632,6 +637,33 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             });
         }
         def_id
+    }
+
+    /// Given the def-id and substs a closure, creates the type of
+    /// `self` argument that the closure expects. For example, for a
+    /// `Fn` closure, this would return a reference type `&T` where
+    /// `T=closure_ty`.
+    ///
+    /// Returns `None` if this closure's kind has not yet been inferred.
+    /// This should only be possible during type checking.
+    ///
+    /// Note that the return value is a late-bound region and hence
+    /// wrapped in a binder.
+    pub fn closure_env_ty(self,
+                          closure_def_id: DefId,
+                          closure_substs: ty::ClosureSubsts<'tcx>)
+                          -> Option<ty::Binder<Ty<'tcx>>>
+    {
+        let closure_ty = self.mk_closure(closure_def_id, closure_substs);
+        let env_region = ty::ReLateBound(ty::DebruijnIndex::new(1), ty::BrEnv);
+        let closure_kind_ty = closure_substs.closure_kind_ty(closure_def_id, self);
+        let closure_kind = closure_kind_ty.to_opt_closure_kind()?;
+        let env_ty = match closure_kind {
+            ty::ClosureKind::Fn => self.mk_imm_ref(self.mk_region(env_region), closure_ty),
+            ty::ClosureKind::FnMut => self.mk_mut_ref(self.mk_region(env_region), closure_ty),
+            ty::ClosureKind::FnOnce => closure_ty,
+        };
+        Some(ty::Binder(env_ty))
     }
 
     /// Given the def-id of some item that has no type parameters, make
@@ -754,6 +786,9 @@ impl<'a, 'gcx, 'tcx, W> TypeVisitor<'tcx> for TypeIdHasher<'a, 'gcx, 'tcx, W>
                     self.def_id(d);
                 }
             }
+            TyGeneratorWitness(tys) => {
+                self.hash(tys.skip_binder().len());
+            }
             TyTuple(tys, defaulted) => {
                 self.hash(tys.len());
                 self.hash(defaulted);
@@ -793,6 +828,8 @@ impl<'a, 'gcx, 'tcx, W> TypeVisitor<'tcx> for TypeIdHasher<'a, 'gcx, 'tcx, W>
             ty::ReEarlyBound(ty::EarlyBoundRegion { def_id, .. }) => {
                 self.def_id(def_id);
             }
+
+            ty::ReClosureBound(..) |
             ty::ReLateBound(..) |
             ty::ReFree(..) |
             ty::ReScope(..) |
@@ -1108,7 +1145,7 @@ fn needs_drop_raw<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         // Fast-path for primitive types
         ty::TyInfer(ty::FreshIntTy(_)) | ty::TyInfer(ty::FreshFloatTy(_)) |
         ty::TyBool | ty::TyInt(_) | ty::TyUint(_) | ty::TyFloat(_) | ty::TyNever |
-        ty::TyFnDef(..) | ty::TyFnPtr(_) | ty::TyChar |
+        ty::TyFnDef(..) | ty::TyFnPtr(_) | ty::TyChar | ty::TyGeneratorWitness(..) |
         ty::TyRawPtr(_) | ty::TyRef(..) | ty::TyStr => false,
 
         // Foreign types can never have destructors
@@ -1162,6 +1199,7 @@ fn needs_drop_raw<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 pub enum ExplicitSelf<'tcx> {
     ByValue,
     ByReference(ty::Region<'tcx>, hir::Mutability),
+    ByRawPointer(hir::Mutability),
     ByBox,
     Other
 }
@@ -1202,10 +1240,15 @@ impl<'tcx> ExplicitSelf<'tcx> {
 
         match self_arg_ty.sty {
             _ if is_self_ty(self_arg_ty) => ByValue,
-            ty::TyRef(region, ty::TypeAndMut { ty, mutbl}) if is_self_ty(ty) => {
+            ty::TyRef(region, ty::TypeAndMut { ty, mutbl }) if is_self_ty(ty) => {
                 ByReference(region, mutbl)
             }
-            ty::TyAdt(def, _) if def.is_box() && is_self_ty(self_arg_ty.boxed_ty()) => ByBox,
+            ty::TyRawPtr(ty::TypeAndMut { ty, mutbl }) if is_self_ty(ty) => {
+                ByRawPointer(mutbl)
+            }
+            ty::TyAdt(def, _) if def.is_box() && is_self_ty(self_arg_ty.boxed_ty()) => {
+                ByBox
+            }
             _ => Other
         }
     }

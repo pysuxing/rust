@@ -299,12 +299,11 @@ pub enum RelocMode {
 #[repr(C)]
 pub enum CodeModel {
     Other,
-    Default,
-    JITDefault,
     Small,
     Kernel,
     Medium,
     Large,
+    None,
 }
 
 /// LLVMRustDiagnosticKind
@@ -331,7 +330,6 @@ pub enum DiagnosticKind {
 pub enum ArchiveKind {
     Other,
     K_GNU,
-    K_MIPS64,
     K_BSD,
     K_COFF,
 }
@@ -498,6 +496,10 @@ pub mod debuginfo {
             const FlagStaticMember        = (1 << 12);
             const FlagLValueReference     = (1 << 13);
             const FlagRValueReference     = (1 << 14);
+            const FlagExternalTypeRef     = (1 << 15);
+            const FlagIntroducedVirtual   = (1 << 18);
+            const FlagBitField            = (1 << 19);
+            const FlagNoReturn            = (1 << 20);
             const FlagMainSubprogram      = (1 << 21);
         }
     }
@@ -505,20 +507,16 @@ pub mod debuginfo {
 
 pub enum ModuleBuffer {}
 
-// Link to our native llvm bindings (things that we need to use the C++ api
-// for) and because llvm is written in C++ we need to link against libstdc++
-//
-// You'll probably notice that there is an omission of all LLVM libraries
-// from this location. This is because the set of LLVM libraries that we
-// link to is mostly defined by LLVM, and the `llvm-config` tool is used to
-// figure out the exact set of libraries. To do this, the build system
-// generates an llvmdeps.rs file next to this one which will be
-// automatically updated whenever LLVM is updated to include an up-to-date
-// set of the libraries we need to link to LLVM for.
-#[link(name = "rustllvm", kind = "static")] // not quite true but good enough
+// This annotation is primarily needed for MSVC where attributes like
+// dllimport/dllexport are applied and need to be correct for everything to
+// link successfully. The #[link] annotation here says "these symbols are
+// included statically" which means that they're all exported with dllexport
+// and from the rustc_llvm dynamic library. Otherwise the rustc_trans dynamic
+// library would not be able to access these symbols.
+#[link(name = "rustllvm", kind = "static")]
 extern "C" {
     // Create and destroy contexts.
-    pub fn LLVMContextCreate() -> ContextRef;
+    pub fn LLVMRustContextCreate(shouldDiscardNames: bool) -> ContextRef;
     pub fn LLVMContextDispose(C: ContextRef);
     pub fn LLVMGetMDKindIDInContext(C: ContextRef, Name: *const c_char, SLen: c_uint) -> c_uint;
 
@@ -541,9 +539,6 @@ extern "C" {
 
     /// See llvm::LLVMTypeKind::getTypeID.
     pub fn LLVMRustGetTypeKind(Ty: TypeRef) -> TypeKind;
-
-    /// See llvm::Value::getContext
-    pub fn LLVMRustGetValueContext(V: ValueRef) -> ContextRef;
 
     // Operations on integer types
     pub fn LLVMInt1TypeInContext(C: ContextRef) -> TypeRef;
@@ -587,6 +582,7 @@ extern "C" {
 
     // Operations on other types
     pub fn LLVMVoidTypeInContext(C: ContextRef) -> TypeRef;
+    pub fn LLVMX86MMXTypeInContext(C: ContextRef) -> TypeRef;
     pub fn LLVMRustMetadataTypeInContext(C: ContextRef) -> TypeRef;
 
     // Operations on all values
@@ -815,13 +811,12 @@ extern "C" {
                                Bundle: OperandBundleDefRef,
                                Name: *const c_char)
                                -> ValueRef;
-    pub fn LLVMRustBuildLandingPad(B: BuilderRef,
-                                   Ty: TypeRef,
-                                   PersFn: ValueRef,
-                                   NumClauses: c_uint,
-                                   Name: *const c_char,
-                                   F: ValueRef)
-                                   -> ValueRef;
+    pub fn LLVMBuildLandingPad(B: BuilderRef,
+                               Ty: TypeRef,
+                               PersFn: ValueRef,
+                               NumClauses: c_uint,
+                               Name: *const c_char)
+                               -> ValueRef;
     pub fn LLVMBuildResume(B: BuilderRef, Exn: ValueRef) -> ValueRef;
     pub fn LLVMBuildUnreachable(B: BuilderRef) -> ValueRef;
 
@@ -1322,9 +1317,6 @@ extern "C" {
                              ElementCount: c_uint,
                              Packed: Bool);
 
-    /// Enables LLVM debug output.
-    pub fn LLVMRustSetDebug(Enabled: c_int);
-
     /// Prepares inline assembly.
     pub fn LLVMRustInlineAsm(Ty: TypeRef,
                              AsmString: *const c_char,
@@ -1556,7 +1548,7 @@ extern "C" {
                                                 InlinedAt: MetadataRef)
                                                 -> ValueRef;
     pub fn LLVMRustDIBuilderCreateOpDeref() -> i64;
-    pub fn LLVMRustDIBuilderCreateOpPlus() -> i64;
+    pub fn LLVMRustDIBuilderCreateOpPlusUconst() -> i64;
 
     pub fn LLVMRustWriteTypeToString(Type: TypeRef, s: RustStringRef);
     pub fn LLVMRustWriteValueToString(value_ref: ValueRef, s: RustStringRef);
@@ -1617,7 +1609,6 @@ extern "C" {
     pub fn LLVMRustSetNormalizedTarget(M: ModuleRef, triple: *const c_char);
     pub fn LLVMRustAddAlwaysInlinePass(P: PassManagerBuilderRef, AddLifetimes: bool);
     pub fn LLVMRustLinkInExternalBitcode(M: ModuleRef, bc: *const c_char, len: size_t) -> bool;
-    pub fn LLVMRustLinkInParsedExternalBitcode(M: ModuleRef, M: ModuleRef) -> bool;
     pub fn LLVMRustRunRestrictionPass(M: ModuleRef, syms: *const *const c_char, len: size_t);
     pub fn LLVMRustMarkAllFunctionsNounwind(M: ModuleRef);
 
@@ -1653,8 +1644,6 @@ extern "C" {
     pub fn LLVMRustWriteDiagnosticInfoToString(DI: DiagnosticInfoRef, s: RustStringRef);
     pub fn LLVMRustGetDiagInfoKind(DI: DiagnosticInfoRef) -> DiagnosticKind;
 
-    pub fn LLVMRustWriteDebugLocToString(C: ContextRef, DL: DebugLocRef, s: RustStringRef);
-
     pub fn LLVMRustSetInlineAsmDiagnosticHandler(C: ContextRef,
                                                  H: InlineAsmDiagHandler,
                                                  CX: *mut c_void);
@@ -1674,7 +1663,6 @@ extern "C" {
     pub fn LLVMRustArchiveMemberFree(Member: RustArchiveMemberRef);
 
     pub fn LLVMRustSetDataLayoutFromTargetMachine(M: ModuleRef, TM: TargetMachineRef);
-    pub fn LLVMRustGetModuleDataLayout(M: ModuleRef) -> TargetDataRef;
 
     pub fn LLVMRustBuildOperandBundleDef(Name: *const c_char,
                                          Inputs: *const ValueRef,
@@ -1731,4 +1719,9 @@ extern "C" {
         Identifier: *const c_char,
     ) -> ModuleRef;
     pub fn LLVMGetModuleIdentifier(M: ModuleRef, size: *mut usize) -> *const c_char;
+    pub fn LLVMRustThinLTOGetDICompileUnit(M: ModuleRef,
+                                           CU1: *mut *mut c_void,
+                                           CU2: *mut *mut c_void);
+    pub fn LLVMRustThinLTOPatchDICompileUnit(M: ModuleRef, CU: *mut c_void);
+    pub fn LLVMRustThinLTORemoveAvailableExternally(M: ModuleRef);
 }
